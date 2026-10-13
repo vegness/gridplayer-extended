@@ -1,0 +1,17 @@
+# Dotstuff
+.*/
+.coverage
+!.github/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+
+# Scratch space: build logs, probe scripts, test videos
+temp/
+data/

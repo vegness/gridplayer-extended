@@ -1,0 +1,18 @@
+- name: {APP_MODULE}
+  buildsystem: simple
+  build-commands:
+  - pip3 install --no-index --no-deps --no-build-isolation --prefix=${FLATPAK_DEST} --root=/ .
+  sources:
+  - type: archive
+    path: {TAR_FILE}
+    sha256: {TAR_FILE_SHA256}
+- name: meta
+  buildsystem: simple
+  build-commands:
+  - install -Dm 644 {APP_ID}.desktop     ${FLATPAK_DEST}/share/applications/{APP_ID}.desktop
+  - install -Dm 644 {APP_ID}.appdata.xml ${FLATPAK_DEST}/share/metainfo/{APP_ID}.appdata.xml
+  - install -Dm 644 {APP_ID}.xml         ${FLATPAK_DEST}/share/mime/packages/{APP_ID}.xml
+  - (cd icons && find * -type f -exec install -Dm 644 "{}" "${FLATPAK_DEST}/share/icons/{}" \;)
+  sources:
+  - type: dir
+    path: ./meta

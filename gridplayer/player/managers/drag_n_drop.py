@@ -1,0 +1,581 @@
+from pathlib import Path
+
+from PyQt5.QtCore import QEvent, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QCursor, QDrag
+from PyQt5.QtWidgets import QApplication
+
+from gridplayer.models.media_list import as_path
+from gridplayer.params import env
+from gridplayer.player.managers.base import ManagerBase
+from gridplayer.playlist_settings import PlaylistSettings
+from gridplayer.settings import Settings
+from gridplayer.utils.drag_n_drop import drop_is_replace, query_drop_modifiers
+from gridplayer.utils.drop_zone import (
+    DropIndicator,
+    DropZone,
+    adds_to_list,
+    indicator_for,
+    zone_at,
+)
+from gridplayer.utils.excepthook import dragging
+from gridplayer.utils.files import (
+    cell_mime_data,
+    extract_mime_list,
+    extract_mime_uris,
+    extract_mime_video,
+    get_playlist_path,
+    mime_has_video,
+)
+from gridplayer.utils.keymap import drop_switch_modifier
+from gridplayer.utils.qt import is_modal_open
+
+# X11 XDND Enter is a later client message, not already queued. timer(0)
+# ends drag UI (and overlay input passthrough) before the player gets Enter.
+# KWin then drops onto a window Qt is no longer tracking — no XdndFinished,
+# Dolphin keeps the + cursor, and this process never accepts another drop.
+_DRAG_LEAVE_GRACE_MS = 250 if env.IS_LINUX else 0
+
+
+class DragNDropManager(ManagerBase):
+    playlist_dropped = pyqtSignal(Path)
+    set_drag_ui = pyqtSignal(bool)
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+        self._drag_start_position = None
+
+        self._is_fake_drag_active = False
+        self._is_swallow_click_after_fake_drag = False
+
+        self._drop_block = None
+        self._drop_zone = None
+        self._drop_is_internal = False
+        self._drop_is_replace = False
+        self._drop_is_add_to_list = False
+        self._source_block = None
+
+        # Overlay Tool windows (and overlay ↔ player) emit DragLeave before
+        # the next target's DragEnter. End drag UI on the next tick so a
+        # cancel / leave-window still resets chrome and glyphs.
+        self._drag_leave_timer = QTimer(self)
+        self._drag_leave_timer.setSingleShot(True)
+        self._drag_leave_timer.timeout.connect(self._end_drag_ui_after_leave)
+
+    @property
+    def commands(self):
+        return {
+            "handle_fake_drag_click": self.handle_fake_drag_click,
+        }
+
+    @property
+    def event_map(self):
+        return {
+            QEvent.MouseMove: self.mouseMoveEvent,
+            QEvent.MouseButtonPress: self.mousePressEvent,
+            QEvent.MouseButtonRelease: self.mouseReleaseEvent,
+            QEvent.KeyPress: self.keyPressEvent,
+            QEvent.KeyRelease: self.keyReleaseEvent,
+            QEvent.ShortcutOverride: self.shortcutOverrideEvent,
+            QEvent.ApplicationDeactivate: self.applicationDeactivateEvent,
+            QEvent.DragEnter: self.dragEnterEvent,
+            QEvent.Drop: self.dropEvent,
+            QEvent.DragMove: self.dragMoveEvent,
+            QEvent.DragLeave: self.dragLeaveEvent,
+        }
+
+    def eventFilter(self, event_object, event) -> bool:
+        # the List window over a video: a press there is no drag of the video,
+        # nor the player to bring to the front, and rows dropped there are
+        # the list's
+        if event.type() in self.event_map and self.is_elsewhere(event_object):
+            return False
+
+        return super().eventFilter(event_object, event)
+
+    # --- start drag (mouse) ---
+
+    def mousePressEvent(self, event):
+        if self._is_fake_drag_active:
+            return True
+
+        self._is_swallow_click_after_fake_drag = False
+
+        if is_modal_open():
+            self._drag_start_position = None
+            return
+
+        vb_under_mouse = self._ctx.commands.get_video_block_under_mouse()
+        if vb_under_mouse is None:
+            self._drag_start_position = None
+            return
+
+        # Overlay Tool windows eat X11 focus. Activate the player so Shift
+        # is delivered if the click started while another app was focused.
+        self._ctx.commands.activate_window()
+
+        if event.button() != Qt.LeftButton:
+            return
+
+        # dragging the picture about instead, see PanManager (a selection
+        # to zoom to has taken its press before this, see ZoomSelectManager)
+        if self._ctx.commands.is_pan_press(event):
+            self._drag_start_position = None
+            return
+
+        self._drag_start_position = event.pos()
+
+    def mouseMoveEvent(self, event):
+        if is_modal_open():
+            self._drag_start_position = None
+            self._cancel_fake_drag()
+            return
+
+        if self._is_fake_drag_active:
+            self._update_drop_target(QCursor.pos(), is_internal=True)
+            return True
+
+        if not self._is_drag_started(event):
+            return
+
+        # Native QDrag on xcb/XWayland freezes modifiers (pointer grab) and
+        # GNOME does not forward keys to an unfocused X11 window.
+        if env.IS_LINUX and not Settings().get("internal/force_native_drag_events"):
+            self._start_fake_drag()
+            return True
+
+        source = self._ctx.active_block
+        drag = self._make_qdrag(source)
+        if drag is not None:
+            self._ensure_drag_ui()
+            self._set_source(source)
+            with dragging():
+                drag.exec()
+            self._end_drag_ui()
+
+    def mouseReleaseEvent(self, event):
+        if not self._is_fake_drag_active:
+            return None
+
+        if event.button() != Qt.LeftButton:
+            return None
+
+        self._finish_fake_drag()
+
+    def _is_drag_started(self, event):
+        if is_modal_open():
+            return False
+
+        if not event.buttons() & Qt.LeftButton:
+            return False
+
+        if self._drag_start_position is None:
+            return False
+
+        drag_distance = (event.pos() - self._drag_start_position).manhattanLength()
+        if drag_distance < QApplication.startDragDistance():
+            return False
+
+        return self._ctx.active_block is not None
+
+    def _make_qdrag(self, block):
+        if block is None:
+            return None
+
+        self._drag_start_position = None
+        drag = QDrag(self.parent())
+        drag.setMimeData(cell_mime_data(block.drag_data, block.media_list))
+        return drag
+
+    # --- Fake drag (Linux xcb / XWayland) ---
+    # KWin forbids the native QDrag cursor. GNOME/XWayland also swallows
+    # modifier keys during QDrag.exec(). Remove when native Wayland is an option.
+
+    def _start_fake_drag(self):
+        block = self._ctx.active_block
+        if block is None:
+            return
+
+        self._is_fake_drag_active = True
+        self._drag_start_position = None
+        QApplication.setOverrideCursor(Qt.ClosedHandCursor)
+        self._ensure_drag_ui()
+        self._set_source(block)
+        self._update_drop_target(QCursor.pos(), is_internal=True)
+
+    def _finish_fake_drag(self):
+        src = self._source_block
+        dst = self._drop_block
+        zone = self._drop_zone
+        is_replace = self._drop_is_replace
+
+        self._cancel_fake_drag()
+
+        # a cell of this player, moved within it
+        if src:
+            self._drop_on_layout([], src, dst, zone, is_replace)
+
+        self._is_swallow_click_after_fake_drag = True
+
+    def _cancel_fake_drag(self):
+        if self._is_fake_drag_active and QApplication.overrideCursor() is not None:
+            QApplication.restoreOverrideCursor()
+
+        self._is_fake_drag_active = False
+        self._end_drag_ui()
+
+    def handle_fake_drag_click(self, event) -> bool:
+        if not (
+            self._is_swallow_click_after_fake_drag
+            and event.type() == QEvent.MouseButtonRelease
+            and event.button() == Qt.LeftButton
+        ):
+            return False
+
+        self._is_swallow_click_after_fake_drag = False
+        return True
+
+    def shortcutOverrideEvent(self, event):
+        if not self._is_fake_drag_active:
+            return None
+
+        # Avoid play/pause if canceled while cursor was over video
+        self._is_swallow_click_after_fake_drag = True
+        self._update_drop_target(QCursor.pos(), is_internal=True)
+        event.accept()
+        return True
+
+    def keyPressEvent(self, event):
+        if not self._is_fake_drag_active:
+            return None
+
+        if event.key() == Qt.Key_Escape:
+            self._cancel_fake_drag()
+            return True
+
+        self._update_drop_target(QCursor.pos(), is_internal=True)
+        return True
+
+    def keyReleaseEvent(self, event):
+        if not self._is_fake_drag_active:
+            return None
+
+        self._update_drop_target(QCursor.pos(), is_internal=True)
+        return True
+
+    def applicationDeactivateEvent(self):
+        # Overlay Tool windows deactivate the player on X11 HW overlays.
+        # Swallow that so chrome does not flicker; do not cancel the drag
+        # (hide/show of those windows would loop).
+        if self._ctx.is_drag_ui:
+            return True
+
+    # --- Qt DND ---
+
+    def dragEnterEvent(self, event, event_object):
+        self._drag_leave_timer.stop()
+
+        if not self._accept_drag(event):
+            return False
+
+        self._ensure_drag_ui()
+        self._keep_player_active()
+        self._set_source(self._local_block_from_event(event))
+        self._update_drop_target_from_event(event, event_object)
+        return True
+
+    def dragMoveEvent(self, event, event_object):
+        self._drag_leave_timer.stop()
+
+        if not self._accept_drag(event):
+            self._clear_hover()
+            return
+
+        self._ensure_drag_ui()
+        self._keep_player_active()
+        self._set_source(self._local_block_from_event(event))
+        self._update_drop_target_from_event(event, event_object)
+
+    def dragLeaveEvent(self, event):
+        if (
+            self._is_fake_drag_active
+            or self._drop_is_internal
+            or not self._ctx.is_drag_ui
+        ):
+            return
+
+        self._drag_leave_timer.start(_DRAG_LEAVE_GRACE_MS)
+
+    def dropEvent(self, event, event_object):
+        self._drag_leave_timer.stop()
+
+        self._update_drop_target_from_event(event, event_object)
+        dst = self._drop_block
+        zone = self._drop_zone
+        is_replace = self._drop_is_replace
+
+        drop_files = extract_mime_uris(event.mimeData())
+        drop_video, drop_list = self._dropped_video(event.mimeData())
+
+        # Always accept so Qt sends XdndFinished. Rejecting from a filter
+        # without that leaves Dolphin and QXcbDrag stuck until restart.
+        event.acceptProposedAction()
+        QTimer.singleShot(
+            0,
+            lambda: self._finish_drop(
+                drop_files, drop_video, drop_list, dst, zone, is_replace
+            ),
+        )
+        return True
+
+    def _finish_drop(self, drop_files, drop_video, drop_list, dst, zone, is_replace):
+        self._end_drag_ui()
+
+        if drop_files:
+            self._drop_files(drop_files, is_replace, dst=dst, zone=zone)
+            return
+
+        if drop_video:
+            self._drop_video_block(drop_video, drop_list, dst, zone, is_replace)
+
+    def _accept_drag(self, event):
+        drag_data = event.mimeData()
+        if not extract_mime_uris(drag_data) and not mime_has_video(drag_data):
+            return False
+
+        event.acceptProposedAction()
+        return True
+
+    def _dropped_video(self, mime_data) -> tuple:
+        """The cell dropped, and the list it plays from where it came from
+        another player: asked for only then, a channel list being large."""
+
+        drop_video = extract_mime_video(mime_data)
+
+        if drop_video is None or self._ctx.video_blocks.by_id(drop_video.id):
+            return drop_video, None
+
+        return drop_video, extract_mime_list(mime_data)
+
+    def _local_block_from_event(self, event):
+        drag_video = extract_mime_video(event.mimeData())
+        if not drag_video:
+            return None
+        return self._ctx.video_blocks.by_id(drag_video.id)
+
+    # --- apply drop ---
+
+    def _drop_on_layout(self, videos, src_block, dst, zone, is_replace):
+        self._ctx.commands.layout_drop(videos, src_block, dst, zone, is_replace)
+        if videos:
+            self._ctx.commands.add_recent_videos(videos)
+        self._ctx.commands.activate_window()
+
+    def _drop_files(self, drop_files, is_replace, dst=None, zone=None):
+        playlist = get_playlist_path(drop_files)
+
+        if playlist:
+            self.playlist_dropped.emit(playlist)
+            return
+
+        # read first where it is a folder or a list, and put into cells the
+        # way the playlist says, or the viewer picks
+        self._ctx.commands.add_media(drop_files, drop=(dst, zone, is_replace))
+
+    def _drop_video_block(self, dropped_video, dropped_list, dst, zone, is_replace):
+        src_video = self._ctx.video_blocks.by_id(dropped_video.id)
+
+        if src_video:
+            self._drop_on_layout([], src_video, dst, zone, is_replace)
+            return
+
+        self._log.debug("Dropped video from another instance")
+
+        video = dropped_video.video
+
+        # a file comes over as its path in text, as a link would
+        video.uri = as_path(video.uri)
+
+        # the list it plays from comes along, there before the cell is: it
+        # finds its list as it opens. Under an id of its own, if this
+        # player has one with the same id that is another list by now
+        if dropped_list is not None:
+            video.list_id = self._ctx.lists.add(dropped_list).id
+
+        self._drop_on_layout([video], None, dst, zone, is_replace)
+
+        # kept by the playlist apart from the video, they come along beside
+        # it, once it is in: a full grid turns it away
+        if self._ctx.video_blocks.by_video_id(video.id) is not None:
+            self._ctx.bookmarks.add(video.uri, video.id, dropped_video.bookmarks)
+        elif dropped_list is not None:
+            # and its list with it, no cell left to play from it
+            self._ctx.lists.drop_if_untaken(video.list_id)
+
+    # --- hover / source glyphs ---
+
+    def _ensure_drag_ui(self):
+        if not self._ctx.is_drag_ui:
+            self.set_drag_ui.emit(True)
+
+    def _keep_player_active(self):
+        # Overlay Tool windows are the XDND target in HW mode. KWin treats
+        # that as a focus change; GNOME keeps focus at the drag origin.
+        if env.IS_KDE:
+            self._ctx.commands.activate_window()
+
+    def _is_replace(self, is_internal: bool, event=None) -> bool:
+        action_key = (
+            "playlist/drop_action_internal"
+            if is_internal
+            else "playlist/drop_action_external"
+        )
+        session = PlaylistSettings()
+        return drop_is_replace(
+            query_drop_modifiers(event),
+            session.get(action_key),
+            drop_switch_modifier(),
+        )
+
+    def _end_drag_ui_after_leave(self):
+        if self._is_fake_drag_active:
+            return
+
+        # Overlay Tool windows are 0-alpha click-through except the glyph, so
+        # crossing the circle (or another overlay) is Leave then Enter. Do not
+        # tear down drag UI while the pointer is still over the player.
+        # Skip on Linux: QCursor.pos() is stale during X11 XDND.
+        if self._is_pointer_over_player():
+            return
+
+        self._end_drag_ui()
+
+    def _is_pointer_over_player(self):
+        if env.IS_LINUX:
+            return False
+
+        player = self.parent()
+        if player is None:
+            return False
+
+        # gone on to the List window over it
+        if self.is_elsewhere_at(QCursor.pos()):
+            return False
+
+        return player.rect().contains(player.mapFromGlobal(QCursor.pos()))
+
+    def _end_drag_ui(self):
+        self._drag_leave_timer.stop()
+
+        self._clear_hover()
+        self._set_source(None)
+
+        if not self._ctx.is_drag_ui:
+            return
+
+        self.set_drag_ui.emit(False)
+
+    def _update_drop_target_from_event(self, event, event_object):
+        if not hasattr(event_object, "mapToGlobal"):
+            return
+
+        # event.pos() + mapToGlobal: QCursor.pos() is stale during X11 XDND
+        self._update_drop_target(
+            event_object.mapToGlobal(event.pos()),
+            is_internal=self._local_block_from_event(event) is not None,
+            event=event,
+        )
+
+    def _update_drop_target(self, global_pos, is_internal: bool, event=None):
+        block, zone = self._hover_at(global_pos)
+
+        if getattr(block, "is_empty_cell", False):
+            is_replace = False
+        else:
+            is_replace = self._is_replace(is_internal, event)
+
+        # Only swap with empty cells on internal drag
+        if is_internal and getattr(block, "is_empty_cell", False):
+            zone = DropZone.CENTER
+
+        # files, not a cell from another player, going on the cell's list
+        is_add_to_list = (
+            event is not None
+            and not is_internal
+            and not mime_has_video(event.mimeData())
+            and adds_to_list(block, zone, is_replace)
+        )
+
+        self._set_hover(block, zone, is_internal, is_replace, is_add_to_list)
+
+    def _hover_at(self, global_pos):
+        block = self._ctx.commands.get_cell_at(global_pos)
+        if block is None:
+            return None, None
+
+        local = block.mapFromGlobal(global_pos)
+        zone = zone_at(
+            local.x(),
+            local.y(),
+            block.width(),
+            block.height(),
+            self._ctx.grid_state.mode,
+        )
+        return block, zone
+
+    def _set_hover(self, block, zone, is_internal, is_replace, is_add_to_list):
+        is_nothing_changed = (
+            self._drop_block is block
+            and self._drop_zone is zone
+            and self._drop_is_internal is is_internal
+            and self._drop_is_replace is is_replace
+            and self._drop_is_add_to_list is is_add_to_list
+        )
+
+        if is_nothing_changed:
+            return
+
+        self._clear_hover_indicator_if_not(block)
+        self._drop_block = block
+        self._drop_zone = zone
+        self._drop_is_internal = is_internal
+        self._drop_is_replace = is_replace
+        self._drop_is_add_to_list = is_add_to_list
+
+        if block is not None and block is not self._source_block:
+            block.set_drop_indicator(
+                indicator_for(
+                    zone,
+                    is_internal,
+                    self._ctx.grid_state.mode,
+                    is_replace=is_replace,
+                    is_add_to_list=is_add_to_list,
+                )
+            )
+
+    def _set_source(self, source):
+        if source is self._source_block:
+            return
+
+        if self._source_block is not None:
+            self._source_block.set_drop_indicator(DropIndicator.NONE)
+
+        self._source_block = source
+        if source is not None:
+            source.set_drop_indicator(DropIndicator.SOURCE)
+
+    def _clear_hover(self):
+        self._clear_hover_indicator_if_not(None)
+        self._drop_block = None
+        self._drop_zone = None
+        self._drop_is_internal = False
+        self._drop_is_replace = False
+        self._drop_is_add_to_list = False
+
+    def _clear_hover_indicator_if_not(self, block):
+        if (
+            self._drop_block is not None
+            and self._drop_block is not block
+            and self._drop_block is not self._source_block
+        ):
+            self._drop_block.set_drop_indicator(DropIndicator.NONE)

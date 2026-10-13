@@ -1,0 +1,274 @@
+import sys
+from typing import NamedTuple
+
+from pydantic.version import VERSION as PYDANTIC_VERSION
+from PyQt5.QtCore import PYQT_VERSION_STR, qVersion
+from PyQt5.QtGui import QIcon
+from PyQt5.QtWidgets import QDialog
+
+from gridplayer.dialogs.about_dialog_ui import Ui_AboutDialog
+from gridplayer.params import env
+from gridplayer.params.languages import LANGUAGES
+from gridplayer.version import (
+    __app_bugtracker_url__,
+    __app_license_url__,
+    __app_url__,
+    __display_name__,
+    __fork_author__,
+    __upstream_author__,
+    __upstream_url__,
+    __version__,
+)
+
+PYTHON_VERSION = sys.version.split(" ")[0]
+QT_VERSION = qVersion() or "Unknown"
+
+
+class Attribution(NamedTuple):
+    title: str
+    version: str | None
+    author: str
+    license: str
+    url: str
+
+
+class AboutDialog(QDialog, Ui_AboutDialog):
+    def __init__(self, parent):
+        # imported here and not at the top: streamlink and yt-dlp take a
+        # good third of a second to import, which startup shouldn't wait on
+        from streamlink import __version__ as STREAMLINK_VERSION
+        from yt_dlp.version import __version__ as YT_DLP_VERSION
+
+        from gridplayer.utils.percent_re import untangle_percent_re
+
+        # yt-dlp patches urllib3 as it is imported; see utils/percent_re.py
+        untangle_percent_re()
+
+        try:
+            from curl_cffi import __version__ as CURL_CFFI_VERSION
+        except ImportError:
+            # not shipped where it has no wheel to install from (32-bit Windows)
+            CURL_CFFI_VERSION = None
+
+        super().__init__(parent)
+
+        self.setupUi(self)
+
+        logo_icon = QIcon(str(env.RESOURCES_DIR / "icons" / "main_ico_big.svg"))
+        self.logo.setPixmap(logo_icon.pixmap(self.logo.size()))
+
+        self.name.setText(__display_name__)
+        self.version.setText(
+            self.tr("version {APP_VERSION}").replace("{APP_VERSION}", __version__)
+        )
+
+        about_info = [
+            self.tr(
+                "<p>A modified copy of "
+                '<a href="{UPSTREAM_URL}">{APP_DISP_NAME}</a> '
+                "by {UPSTREAM_AUTHOR}, maintained by {FORK_AUTHOR}.</p>"
+            ),
+            self.tr(
+                "<p>This software is licensed under "
+                '<a href="{APP_LICENSE_URL}">GNU GPL</a> version 3.</p>'
+            ),
+            self.tr(
+                '<p>Source code for this build is available on '
+                '<a href="{APP_URL}">GitHub</a>.<br/>'
+            ),
+            self.tr(
+                "Please send any suggestions and bug reports "
+                '<a href="{APP_BUGTRACKER_URL}">here</a>.</p>'
+            ),
+        ]
+        about_info = "".join(about_info)
+        about_info = about_info.replace("{APP_URL}", __app_url__)
+        about_info = about_info.replace("{APP_BUGTRACKER_URL}", __app_bugtracker_url__)
+        about_info = about_info.replace("{APP_LICENSE_URL}", __app_license_url__)
+        about_info = about_info.replace("{UPSTREAM_URL}", __upstream_url__)
+        about_info = about_info.replace("{UPSTREAM_AUTHOR}", __upstream_author__)
+        about_info = about_info.replace("{FORK_AUTHOR}", __fork_author__)
+        about_info = about_info.replace("{APP_DISP_NAME}", __display_name__)
+
+        self.info.setText(about_info)
+
+        attributions = {
+            "core": [
+                Attribution(
+                    "Python",
+                    PYTHON_VERSION,
+                    "Python Software Foundation",
+                    "Python Software Foundation License",
+                    "https://www.python.org/",
+                ),
+                Attribution(
+                    "Qt",
+                    QT_VERSION,
+                    "Qt Project",
+                    "GPL 2.0, GPL 3.0, and LGPL 3.0",
+                    "https://www.qt.io/",
+                ),
+                Attribution(
+                    "VLC",
+                    env.VLC_VERSION,
+                    "VideoLAN",
+                    "GPL 2.0 or later",
+                    "https://www.videolan.org/",
+                ),
+                # the program this build is a copy of: the one credit the
+                # license does not let slide
+                Attribution(
+                    __display_name__,
+                    None,
+                    __upstream_author__,
+                    "GPL 3.0 or later",
+                    __upstream_url__,
+                ),
+            ],
+            "python": [
+                Attribution(
+                    "PyQt",
+                    PYQT_VERSION_STR,
+                    "Riverbank Computing",
+                    "Riverbank Commercial License and GPL v3",
+                    "https://riverbankcomputing.com/",
+                ),
+                Attribution(
+                    "python-vlc",
+                    env.VLC_PYTHON_VERSION,
+                    "Olivier Aubert",
+                    "GPL 2.0 and LGPL 2.1",
+                    "https://github.com/oaubert/python-vlc",
+                ),
+                Attribution(
+                    "pydantic",
+                    PYDANTIC_VERSION,
+                    "Samuel Colvin",
+                    "MIT License",
+                    "https://github.com/samuelcolvin/pydantic",
+                ),
+                Attribution(
+                    "streamlink",
+                    STREAMLINK_VERSION,
+                    "Christopher Rosell, Streamlink Team",
+                    "BSD-2-Clause License",
+                    "https://github.com/streamlink/streamlink",
+                ),
+                Attribution(
+                    "yt-dlp",
+                    YT_DLP_VERSION,
+                    "Contributors",
+                    "Unlicense License",
+                    "https://github.com/yt-dlp/yt-dlp",
+                ),
+            ],
+            "gui": [
+                Attribution(
+                    "Hack Font",
+                    "3.003",
+                    "Source Foundry",
+                    "MIT License",
+                    "http://sourcefoundry.org/hack/",
+                ),
+                Attribution(
+                    "Basic Icons",
+                    None,
+                    "Icongeek26",
+                    "Flaticon License",
+                    "https://www.flaticon.com/authors/icongeek26",
+                ),
+                Attribution(
+                    "Suru Icons",
+                    None,
+                    "Sam Hewitt",
+                    "Creative Commons Attribution-Share Alike 4.0",
+                    "https://snwh.org/",
+                ),
+                Attribution(
+                    "Flag Icons",
+                    None,
+                    "Panayiotis Lipiridis",
+                    "MIT License",
+                    "https://github.com/lipis/flag-icons",
+                ),
+            ],
+            # the segments skipped and marked in YouTube videos
+            "data": [
+                Attribution(
+                    "SponsorBlock",
+                    None,
+                    "Ajay Ramachandran and contributors",
+                    "CC BY-NC-SA 4.0",
+                    "https://sponsor.ajay.app/",
+                ),
+            ],
+        }
+
+        if CURL_CFFI_VERSION is not None:
+            attributions["python"].append(
+                Attribution(
+                    "curl_cffi",
+                    CURL_CFFI_VERSION,
+                    "lexiforest",
+                    "MIT License",
+                    "https://github.com/lexiforest/curl_cffi",
+                )
+            )
+
+        # tr() kept out of the f-strings, where pylupdate5 cannot see it
+        attributions_txt = [
+            "<style>p, h3 {text-align: center;}</style>",
+            "<h3>" + self.tr("Core") + "</h3>",
+            self.generate_attributions(attributions["core"]),
+            "<h3>" + self.tr("Python packages") + "</h3>",
+            self.generate_attributions(attributions["python"]),
+            "<h3>" + self.tr("Graphics") + "</h3>",
+            self.generate_attributions(attributions["gui"]),
+            "<h3>" + self.tr("Data") + "</h3>",
+            self.generate_attributions(attributions["data"]),
+            "<h3>" + self.tr("Translations") + "</h3>",
+            self.generate_attributions_translations(),
+        ]
+
+        self.attributionsBox.setText("\n".join(attributions_txt))
+
+    def generate_attributions(self, attributions: list[Attribution]):
+        attributions_txt = []
+        for a in attributions:
+            app_title = f"{a.title} {a.version or ''}".strip()
+            app_url = f'<a href="{a.url}">{a.author}</a>'
+
+            attribution_txt = (
+                '<p style="line-height: 130%"><b>{APP_TITLE}</b><br>{APP_URL}<br>'
+                "<i>{LICENSED_UNDER}<br>{APP_LICENSE}</i></p>"
+            )
+
+            attribution_txt = attribution_txt.replace(
+                "{LICENSED_UNDER}", self.tr("Licensed under")
+            )
+            attribution_txt = attribution_txt.replace("{APP_TITLE}", app_title)
+            attribution_txt = attribution_txt.replace("{APP_URL}", app_url)
+            attribution_txt = attribution_txt.replace("{APP_LICENSE}", a.license)
+
+            attributions_txt.append(attribution_txt)
+
+        return "\n".join(attributions_txt)
+
+    def generate_attributions_translations(self):
+        attributions_txt = []
+
+        for language in LANGUAGES:
+            if not language.authors:
+                continue
+
+            attribution_txt = (
+                '<p style="line-height: 130%">'
+                "<b>{language}<br>({country})</b><br>{authors}</p>".format(
+                    language=language.title_native,
+                    country=language.country_native,
+                    authors="<br/>".join(language.author_links),
+                )
+            )
+            attributions_txt.append(attribution_txt)
+
+        return "\n".join(attributions_txt)

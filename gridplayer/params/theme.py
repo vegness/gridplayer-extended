@@ -1,0 +1,349 @@
+from types import MappingProxyType
+
+from PyQt5.QtGui import QColor, QIcon, QPalette, QTextCursor
+from PyQt5.QtWidgets import (
+    QApplication,
+    QLabel,
+    QProxyStyle,
+    QStyle,
+    QStyleFactory,
+    QTextEdit,
+    QWidget,
+)
+
+from gridplayer.main.init_icons import switch_icon_theme
+from gridplayer.params import env
+from gridplayer.params.static import ColorScheme
+from gridplayer.settings import Settings
+from gridplayer.utils.darkmode import is_dark_mode, is_system_dark_mode
+
+THEME_LIGHT = MappingProxyType(
+    {
+        "window": "#eeeeee",
+        "base": "#ffffff",
+        "alternate": "#f5f5f5",
+        "text": "#000000",
+        "text_disabled": "#888888",
+        "text_secondary": "#505050",
+        "button": "#eeeeee",
+        "button_text": "#000000",
+        "highlight": "#bbbbbb",
+        "highlighted_text": "#000000",
+        "tooltip_base": "#ffffff",
+        "tooltip_text": "#000000",
+        "link": "#0066cc",
+        "border": "#aaaaaa",
+        "background": "#eeeeee",
+        "background_selected": "#aaaaaa",
+    }
+)
+
+THEME_DARK = MappingProxyType(
+    {
+        "window": "#444444",
+        "base": "#3a3a3a",
+        "alternate": "#4a4a4a",
+        "text": "#eeeeee",
+        "text_disabled": "#888888",
+        "text_secondary": "#c4c4c4",
+        "button": "#444444",
+        "button_text": "#eeeeee",
+        "highlight": "#666666",
+        "highlighted_text": "#ffffff",
+        "tooltip_base": "#3a3a3a",
+        "tooltip_text": "#eeeeee",
+        "link": "#6ab0ff",
+        "border": "#888888",
+        "background": "#444444",
+        "background_selected": "#888888",
+    }
+)
+
+_applying_theme = False
+
+_DIALOG_ICON_ROLES = (
+    QStyle.SP_DialogOkButton,
+    QStyle.SP_DialogCancelButton,
+    QStyle.SP_DialogHelpButton,
+    QStyle.SP_DialogOpenButton,
+    QStyle.SP_DialogSaveButton,
+    QStyle.SP_DialogCloseButton,
+    QStyle.SP_DialogApplyButton,
+    QStyle.SP_DialogResetButton,
+    QStyle.SP_DialogDiscardButton,
+    QStyle.SP_DialogYesButton,
+    QStyle.SP_DialogNoButton,
+)
+
+
+class NoDialogButtonIcons(QProxyStyle):
+    """Blanks the standard OK/Cancel/etc icons that Linux themes add."""
+
+    def standardIcon(self, element, option=None, widget=None):
+        if element in _DIALOG_ICON_ROLES:
+            return QIcon()
+
+        return super().standardIcon(element, option, widget)
+
+
+def current_colors():
+    return THEME_DARK if is_dark_mode() else THEME_LIGHT
+
+
+def create_fusion_style() -> QProxyStyle:
+    """Fusion style with the platform icons stripped from dialog buttons."""
+    if env.IS_LINUX:
+        return NoDialogButtonIcons(QStyleFactory.create("Fusion"))
+
+    return QStyleFactory.create("Fusion")
+
+
+def fusion_palette() -> QPalette:
+    colors = current_colors()
+    palette = QPalette()
+
+    def color(key: str) -> QColor:
+        return QColor(colors[key])
+
+    palette.setColor(QPalette.Window, color("window"))
+    palette.setColor(QPalette.WindowText, color("text"))
+    palette.setColor(QPalette.Base, color("base"))
+    palette.setColor(QPalette.AlternateBase, color("alternate"))
+    palette.setColor(QPalette.ToolTipBase, color("tooltip_base"))
+    palette.setColor(QPalette.ToolTipText, color("tooltip_text"))
+    palette.setColor(QPalette.Text, color("text"))
+    palette.setColor(QPalette.Button, color("button"))
+    palette.setColor(QPalette.ButtonText, color("button_text"))
+    palette.setColor(QPalette.BrightText, QColor("#ff4444"))
+    palette.setColor(QPalette.Link, color("link"))
+    palette.setColor(QPalette.Highlight, color("highlight"))
+    palette.setColor(QPalette.HighlightedText, color("highlighted_text"))
+    palette.setColor(QPalette.PlaceholderText, color("text_disabled"))
+
+    disabled_text = color("text_disabled")
+    for role in (QPalette.Text, QPalette.WindowText, QPalette.ButtonText):
+        palette.setColor(QPalette.Disabled, role, disabled_text)
+    palette.setColor(QPalette.Disabled, QPalette.Highlight, QColor("#666666"))
+    palette.setColor(QPalette.Disabled, QPalette.HighlightedText, disabled_text)
+
+    return palette
+
+
+def selection_fill() -> QColor:
+    """Same color Fusion lists/combos use. Do not read item-widget palettes."""
+    return QColor(current_colors()["highlight"])
+
+
+def combo_popup_stylesheet() -> str:
+    colors = current_colors()
+    return (
+        "QComboBox QAbstractItemView {"
+        f"background-color: {colors['base']};"
+        f"color: {colors['text']};"
+        f"selection-background-color: {colors['highlight']};"
+        f"selection-color: {colors['highlighted_text']};"
+        f"border: 1px solid {colors['border']};"
+        "outline: 0;"
+        "}"
+        "QListWidget#section_index::item:disabled {"
+        f"color: {colors['text']};"
+        "background: transparent;"
+        "outline: 0;"
+        "}"
+    )
+
+
+def secondary_text_color() -> QColor:
+    """Text that says less than the text around it, and is still meant to
+    be read: lighter than the text, darker than a placeholder or a disabled
+    control."""
+
+    return QColor(current_colors()["text_secondary"])
+
+
+def set_secondary(widget: QWidget, is_secondary: bool = True) -> None:
+    """A label in the secondary text colour, or back in the text colour;
+    it follows the theme as it switches."""
+
+    widget.setProperty("secondary", is_secondary)
+
+    # a property is matched by the style sheet only as the widget is polished
+    widget.style().unpolish(widget)
+    widget.style().polish(widget)
+    widget.update()
+
+
+def secondary_stylesheet() -> str:
+    return (
+        f'QLabel[secondary="true"] {{ color: {current_colors()["text_secondary"]}; }}'
+    )
+
+
+def tooltip_stylesheet() -> str:
+    """Qt's own tooltip, for what widgets.tooltip leaves to it (tabs, menu
+    items, headers), in the same colours as ours."""
+
+    colors = current_colors()
+    return (
+        "QToolTip {"
+        f"background-color: {colors['tooltip_base']};"
+        f"color: {colors['tooltip_text']};"
+        f"border: 1px solid {colors['border']};"
+        "padding: 3px 6px;"
+        "}"
+    )
+
+
+def on_system_theme_changed(app=None) -> None:
+    """Re-apply theme only when the user is following the OS."""
+    try:
+        scheme = Settings().get("player/color_scheme")
+    except RuntimeError:
+        return
+
+    if scheme != ColorScheme.SYSTEM:
+        return
+
+    apply_theme(app)
+
+
+def _recolor_document_anchors(document, color: QColor) -> None:
+    block = document.begin()
+    while block.isValid():
+        iterator = block.begin()
+        while not iterator.atEnd():
+            fragment = iterator.fragment()
+            fmt = fragment.charFormat()
+            if fmt.isAnchor():
+                fmt.setForeground(color)
+                cursor = QTextCursor(document)
+                cursor.setPosition(fragment.position())
+                cursor.setPosition(
+                    fragment.position() + fragment.length(),
+                    QTextCursor.KeepAnchor,
+                )
+                cursor.mergeCharFormat(fmt)
+            iterator += 1
+        block = block.next()
+
+
+_LINK_SRC_PROP = "gp_html_src"
+
+
+def _label_html_source(widget: QLabel) -> str | None:
+    stored = widget.property(_LINK_SRC_PROP)
+    if stored:
+        return stored
+
+    text = widget.text()
+    if "<a" not in text.lower():
+        return None
+    # QLabel.text() after setText() is Qt's exported document, not the source.
+    if "qrichtext" in text.lower() or text.lstrip().lower().startswith("<!doctype"):
+        return None
+
+    widget.setProperty(_LINK_SRC_PROP, text)
+    return text
+
+
+def _html_with_link_color(html: str, color: QColor) -> str:
+    return f"<style>a{{color:{color.name()}}}</style>{html}"
+
+
+def set_html_with_links(label: QLabel, html: str) -> None:
+    """Put HTML on a label so its links come out the theme's colour.
+
+    A label bakes the link colour into its document as the text is set,
+    so anything written after the theme was applied comes out in Qt's
+    own blue, which on a dark base is barely there. Text set once at
+    startup is caught by the sweep below; text written later, as a
+    dialog fills itself in, has to say so here.
+
+    The unstyled source is kept on the widget, so that sweep can colour
+    the links again from scratch when the system theme switches rather
+    than layering one rule over another.
+    """
+
+    label.setProperty(_LINK_SRC_PROP, html)
+
+    label.setText(_html_with_link_color(html, QColor(current_colors()["link"])))
+
+
+def _refresh_html_links(app) -> None:
+    """HTML link color is baked into the document; palette Link is not enough."""
+    link = QColor(current_colors()["link"])
+    css = f"a {{ color: {link.name()}; }}"
+
+    for widget in app.allWidgets():
+        if isinstance(widget, QLabel):
+            source = _label_html_source(widget)
+            if source:
+                widget.setText(_html_with_link_color(source, link))
+        elif isinstance(widget, QTextEdit):
+            widget.document().setDefaultStyleSheet(css)
+            _recolor_document_anchors(widget.document(), link)
+
+
+def apply_theme(app=None) -> None:
+    """Apply Fusion palette, combo popup colors, and symbolic icon theme."""
+    global _applying_theme
+    if _applying_theme:
+        return
+
+    # the system may have switched since it was last asked
+    is_system_dark_mode.cache_clear()
+
+    app = app or QApplication.instance()
+    if app is None:
+        return
+
+    _applying_theme = True
+    try:
+        switch_icon_theme()
+        _install_dialog_button_style(app)
+        app.setPalette(fusion_palette())
+        app.setStyleSheet(
+            combo_popup_stylesheet() + tooltip_stylesheet() + secondary_stylesheet()
+        )
+        _refresh_html_links(app)
+        _apply_native_window_chrome(app)
+    finally:
+        _applying_theme = False
+
+
+_dialog_button_style_installed = False
+
+
+def _install_dialog_button_style(app) -> None:
+    """Wrap the app style so dialog buttons never get theme icons.
+
+    The GNOME platform theme reports "buttons have icons"; QDialogButtonBox
+    and QMessageBox fetch those icons from the style, so a proxy style
+    removes them for every dialog at once. Installed once per process: the
+    app stylesheet wraps the app style afterwards, hiding it from
+    isinstance() checks.
+    """
+    if not env.IS_LINUX:
+        return
+
+    global _dialog_button_style_installed
+    if _dialog_button_style_installed:
+        return
+
+    app.setStyle(NoDialogButtonIcons(QStyleFactory.create("Fusion")))
+    _dialog_button_style_installed = True
+
+
+def _apply_native_window_chrome(app) -> None:
+    if env.IS_LINUX:
+        from gridplayer.utils.wayland import refresh_window_frames
+
+        refresh_window_frames()
+        return
+
+    if not env.IS_WINDOWS:
+        return
+    from gridplayer.utils.win32_window import apply_native_background
+
+    for widget in app.topLevelWidgets():
+        apply_native_background(widget, create=False)

@@ -1,0 +1,155 @@
+[build-system]
+requires = ["uv_build>=0.11.30,<0.13.0"]
+build-backend = "uv_build"
+
+[project]
+name = "gridplayer"
+version = "0.5.5"
+description = "Play videos side-by-side"
+# The original author, kept here because this is their work at its core.
+# The GPL requires the notice to survive, and removing it would be a
+# misstatement of who wrote what.
+authors = [
+    { name = "vzhd1701", email = "vzhd1701@gmail.com" },
+    { name = "vegness", email = "504168521@qq.com" },
+]
+requires-python = ">=3.10"
+readme = "README.md"
+license-files = ["LICENSE"]
+license = "GPL-3.0-or-later"
+keywords = [
+    "video",
+    "player",
+    "vlc",
+    "pyqt",
+    "Qt5",
+    "multimedia",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "Natural Language :: English",
+    "Environment :: X11 Applications :: Qt",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft",
+    "Operating System :: Unix",
+    "Topic :: Multimedia :: Video :: Display",
+]
+dependencies = [
+    "PyQt5==5.15.11",
+    "PyQt5-Qt5==5.15.2 ; sys_platform == 'win32'",
+    "PyQt5-Qt5==5.15.19 ; sys_platform != 'win32'",
+    "pydantic (>=2.12.5,<3.0.0)",
+    "pydantic-extra-types (>=2.10.6,<3.0.0)",
+    "pycountry (>=24.6.1)",
+    "streamlink (>=8.4.0,<9.0.0)",
+    # curl-cffi has no 32-bit Windows wheel, building it from source there
+    # takes MSVC, and no marker can tell 32-bit Python from 64-bit on
+    # Windows, so the 32-bit build strips it out in build_win.sh
+    "yt-dlp[default,curl-cffi] (>=2026.07.04,<2027.0.0)",
+    "pyobjc-core ; sys_platform == 'darwin'",
+    "pyobjc-framework-Cocoa ; sys_platform == 'darwin'",
+    # media keys in the background
+    "pyobjc-framework-MediaPlayer ; sys_platform == 'darwin'",
+    "winrt-runtime (>=3.2.1,<4.0.0) ; sys_platform == 'win32'",
+    "winrt-Windows.Foundation (>=3.2.1,<4.0.0) ; sys_platform == 'win32'",
+    "winrt-Windows.Media (>=3.2.1,<4.0.0) ; sys_platform == 'win32'",
+    "winrt-Windows.Media.Playback (>=3.2.1,<4.0.0) ; sys_platform == 'win32'",
+]
+
+[project.urls]
+repository = "https://github.com/vegness/gridplayer-extended"
+changelog = "https://github.com/vegness/gridplayer-extended/blob/master/CHANGELOG.md"
+issues = "https://github.com/vegness/gridplayer-extended/issues"
+# where the code this fork is built on comes from
+upstream = "https://github.com/vzhd1701/gridplayer"
+
+[project.scripts]
+gridplayer = "gridplayer.__main__:main"
+
+[dependency-groups]
+dev = [
+    "keepachangelog==2.0.0",
+    "pre-commit",
+    "pytest",
+    "pytest-cov",
+    "pytest-mock",
+    "ruff",
+    "rumdl",
+]
+
+[tool.uv.build-backend]
+module-root = ""
+
+[tool.ruff]
+extend-exclude = ["gridplayer/vlc_player/vlc.py"]
+force-exclude = true
+
+[tool.ruff.format]
+line-ending = "lf"
+
+[tool.ruff.lint]
+exclude = ["scripts/*"]
+select = [
+    # Complexity
+    #"PL",   # pylint
+    #"C90",  # maccabe
+
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    ##"COM",  # flake8-commas
+    ##"D",    # pydocstyle
+    "DTZ",  # flake8-datetimez
+    "E",    # pycodestyle
+    #"ERA",  # flake8-eradicate
+    "EXE",  # flake8-executable
+    "F",    # pyflakes
+    ##"FBT",  # flake8-boolean-trap
+    "FLY",  # pyflint
+    ##"FURB", # refurb
+    ##"G",    # flake8-logging-format
+    "I",    # isort
+    "ICN",  # flake8-import-conventions
+    "ISC",  # flake8-implicit-str-concat
+    "LOG",  # flake8-logging
+    ##"N",    # pep8-naming
+    "PERF", # perflint
+    "PIE",  # flake8-pie
+    "PT",   # flake8-pytest-style
+    "PTH",  # flake8-use-pathlib
+    "Q",    # flake8-quotes
+    ##"RET",  # flake8-return
+    "RSE",  # flake8-raise
+    "RUF",  # ruff
+    #"S",    # flake8-bandit
+    ##"SIM",  # flake8-simpify
+    ##"SLF",  # flake8-self
+    "SLOT", # flake8-slots
+    "T100", # flake8-debugger
+    "TID",  # flake8-tidy-imports
+    "TRY",  # tryceratops
+    "UP",   # pyupgrade
+    "W",    # pycodestyle
+    "YTT",  # flake8-2020
+]
+ignore = [
+    "B904",     # raise from
+    "B905",     # `zip()` without an explicit `strict=` parameter
+    "E501",     # Line too long
+    "RUF012",   # Mutable class attributes should be annotated with `typing.ClassVar`
+    "TRY003",   # long exception messages
+]
+
+[tool.ruff.lint.extend-per-file-ignores]
+"__main__.py" = ["E402"]
+"*_ui.py" = ["E402"]
+
+[tool.ty.src]
+exclude = ["tests"]
+
+[tool.rumdl]
+disable = ["MD013"]
+exclude = ["LICENSE.md"]
+
+[tool.rumdl.per-file-ignores]
+"README.md" = ["MD033", "MD041"]

@@ -1,0 +1,1022 @@
+import contextlib
+import random
+from typing import NamedTuple
+
+from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtWidgets import (
+    QGridLayout,
+    QHBoxLayout,
+    QMessageBox,
+    QSizePolicy,
+    QVBoxLayout,
+)
+
+from gridplayer.dialogs.input_dialog import QCustomSpinboxInput, QFixedGridSizeDialog
+from gridplayer.dialogs.messagebox import QCustomMessageBox
+from gridplayer.models.grid_state import GridState
+from gridplayer.params.static import GridMode
+from gridplayer.player.managers.base import ManagerBase
+from gridplayer.playlist_settings import PlaylistSettings
+from gridplayer.settings import Settings
+from gridplayer.utils.drop_zone import DropZone
+from gridplayer.utils.layout import FlowLayout, FlowMode, GridLayout, Layout
+from gridplayer.utils.qt import count_txt, translate
+from gridplayer.widgets.empty_cell import EmptyCell
+from gridplayer.widgets.grid_splitter import GridSplitter
+
+# A stand-in total for a splitter that has not been laid out yet, used when
+# restoring saved splits: QSplitter normalises sizes to its own extent, so
+# only the ratio between them matters, not the numbers themselves.
+_UNREALIZED_SPLIT_TOTAL = 1000
+
+
+class GridDimensions(NamedTuple):
+    cols: int
+    rows: int
+
+    @property
+    def max_size(self):
+        return self.cols * self.rows
+
+
+def _clear_layout(layout):
+    for _ in range(layout.count()):
+        l_item = layout.takeAt(0)
+
+        sublay = l_item.layout()
+
+        if sublay is not None:
+            _clear_layout(sublay)
+            sublay.deleteLater()
+
+
+def _flow_mode(mode: GridMode) -> FlowMode:
+    return FlowMode.COLS if mode == GridMode.AUTO_COLS else FlowMode.ROWS
+
+
+class GridManager(ManagerBase):
+    warning = pyqtSignal(str)
+    layout_changed = pyqtSignal()
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+        self._ctx.grid_state = self.grid_state
+
+        mode = Settings().get("playlist/grid_mode")
+        self._mode = mode
+        self._grid_layout = GridLayout(
+            max_rows=Settings().get("playlist/grid_rows"),
+            max_cols=Settings().get("playlist/grid_cols"),
+            preallocate=Settings().get("playlist/grid_preallocate"),
+        )
+        self._flow = FlowLayout(
+            mode=_flow_mode(mode),
+            size=Settings().get("playlist/grid_size"),
+            is_fit=Settings().get("playlist/grid_fit"),
+        )
+        self._empty_cells = []
+        self._add_anchor = None
+        self._reloading = False
+
+        # Resizable seams between cells: the splitter tree laid out on top of
+        # the QGridLayout, and whether it is being shown instead of it. Off by
+        # default, so a playlist that never asked for it comes up as it always
+        # did.
+        self._is_resizable = Settings().get("playlist/grid_resizable")
+        self._splitter_rows: list[GridSplitter] = []
+        self._splitter_cols: list[GridSplitter] = []
+        self._splitter_root: GridSplitter | None = None
+        self._is_syncing_splitters = False
+
+        # The cell floating in a window of its own, left out of what the grid
+        # draws while it floats; None when none does.
+        self._mini_excluded = None
+
+        self._grid = QGridLayout(self.parent())
+        self._grid.setSpacing(0)
+        self._grid.setContentsMargins(0, 0, 0, 0)
+
+        self._info_label = EmptyCell(
+            message=translate("Main Window", "Drag and drop media files or URLs here"),
+            parent=self.parent(),
+        )
+
+    def init(self):
+        self.layout_changed.emit()
+
+    # --- commands / public queries ---
+
+    @property
+    def commands(self):
+        return {
+            "set_grid_mode": self.cmd_set_grid_mode,
+            "is_grid_mode_set_to": lambda m: self._mode == m,
+            "ask_grid_size": self.cmd_ask_grid_size,
+            "get_grid_size": self.cmd_get_grid_size,
+            "switch_is_grid_fit": self.cmd_switch_is_grid_fit,
+            "is_grid_fit": lambda: self._flow.is_fit,
+            "is_grid_preallocate": lambda: self._grid_layout.preallocate,
+            "switch_grid_preallocate": self.cmd_switch_grid_preallocate,
+            "ask_fixed_grid_size": self.cmd_ask_fixed_grid_size,
+            "get_fixed_grid_size": self.cmd_get_fixed_grid_size,
+            "add_videos_to_layout": self.add_videos_to_layout,
+            "grid_free_capacity": lambda: self._layout.free_capacity(),
+            "layout_drop": self.cmd_layout_drop,
+            "layout_order": lambda: self._layout.order(),
+            "shuffle_layout": self.cmd_shuffle_layout,
+            "get_cell_at": self.get_cell_at,
+            "set_add_anchor": self.set_add_anchor,
+            "grid_cell_count": lambda: self.grid_dimensions.max_size,
+            "set_grid_state": self.set_grid_state,
+            "apply_grid_config": self.apply_grid_config,
+            "is_grid_resizable": lambda: self._is_resizable,
+            "toggle_grid_resizable": self.cmd_toggle_grid_resizable,
+            "set_grid_resizable": self.set_grid_resizable,
+            "grid_layout_without_mini": self.cmd_grid_layout_without_mini,
+            "grid_layout_with_mini_back": self.cmd_grid_layout_with_mini_back,
+        }
+
+    @property
+    def _is_fixed(self):
+        return self._mode == GridMode.FIXED
+
+    @property
+    def _layout(self) -> Layout:
+        return self._grid_layout if self._is_fixed else self._flow
+
+    @property
+    def grid_dimensions(self):
+        cols, rows = self._layout.displayed_size()
+        return GridDimensions(cols, rows)
+
+    @property
+    def _show_empties(self):
+        return self._is_fixed and self._grid_layout.preallocate
+
+    @contextlib.contextmanager
+    def slow_ui_operation(self):
+        self.parent().setUpdatesEnabled(False)
+        try:
+            yield
+        finally:
+            self.parent().setUpdatesEnabled(True)
+
+    @contextlib.contextmanager
+    def _laid_out_once(self):
+        """Lay the cells out once, as they end up, not at every step there.
+
+        Showing a hidden cell lays the grid out there and then, with whatever
+        cells and stretch it has at that point. Showing several in a row, as
+        leaving single mode does, resized the cells already on show through
+        every grid in between: 600x700, then 400x700, then 400x350 in a 3x2
+        grid. A hardware video sends the first of those to VLC at once and
+        holds the rest back (see NATIVE_VIEW_RESIZE_INTERVAL_MS), so it was
+        drawn stretched or zoomed into its cell for a moment.
+        """
+        self._grid.setEnabled(False)
+        try:
+            yield
+        finally:
+            self._grid.setEnabled(True)
+
+        self._grid.activate()
+
+    def grid_state(self):
+        return GridState(
+            mode=self._mode,
+            is_fit=self._flow.is_fit,
+            size=self._flow.size,
+            video_order=list(self._flow.ids),
+            rows=self._grid_layout.max_rows,
+            cols=self._grid_layout.max_cols,
+            preallocate=self._grid_layout.preallocate,
+            cells=list(self._grid_layout.cells),
+            is_resizable=self._is_resizable,
+            splitter_sizes=self._splitter_sizes_state(),
+        )
+
+    def set_grid_state(self, state: GridState) -> None:
+        self._mode = state.mode
+        self._flow.mode = _flow_mode(state.mode)
+        self._flow.is_fit = state.is_fit
+        self._flow.size = state.size
+        self._flow.ids = list(state.video_order)
+        self._grid_layout.max_rows = max(1, state.rows)
+        self._grid_layout.max_cols = max(1, state.cols)
+        self._grid_layout.preallocate = state.preallocate
+        self._grid_layout.cells = [cell.model_copy() for cell in state.cells]
+        self._is_resizable = state.is_resizable
+
+        if self._is_fixed:
+            self._grid_layout.resize(
+                self._grid_layout.max_rows,
+                self._grid_layout.max_cols,
+                self._grid_layout.preallocate,
+            )
+
+        if self._ctx.video_blocks:
+            self._reconcile_layout()
+
+        self._render_video_grid()
+
+        # Only after the tree exists: the splits are ratios, and there is
+        # nothing to put them in until the cells are laid out.
+        self._apply_splitter_sizes_state(state.splitter_sizes)
+
+    def apply_grid_config(self, config: GridState) -> bool:
+        """Apply mode/size/fit/rows/cols/preallocate like the Grid menu.
+
+        Restores do not use this — ``set_grid_state`` keeps cell positions.
+        Returns False if the user cancelled a confirmation dialog.
+        """
+        mode = config.mode
+        rows = max(1, int(config.rows))
+        cols = max(1, int(config.cols))
+        preallocate = bool(config.preallocate)
+
+        same_fixed = (
+            mode == GridMode.FIXED
+            and self._is_fixed
+            and self._grid_layout.max_rows == rows
+            and self._grid_layout.max_cols == cols
+            and self._grid_layout.preallocate == preallocate
+        )
+        same_flow = (
+            mode != GridMode.FIXED
+            and not self._is_fixed
+            and self._mode == mode
+            and self._flow.is_fit == config.is_fit
+            and self._flow.size == config.size
+        )
+        if same_fixed or same_flow:
+            self._flow.is_fit = config.is_fit
+            self._flow.size = config.size
+            return True
+
+        if mode == GridMode.FIXED:
+            if not self._apply_fixed(rows, cols, preallocate):
+                return False
+            self._flow.is_fit = config.is_fit
+            self._flow.size = config.size
+            return True
+
+        if self._is_fixed and not self._leave_fixed():
+            return False
+
+        self._mode = mode
+        self._flow.mode = _flow_mode(mode)
+        self._flow.is_fit = config.is_fit
+        self._flow.size = config.size
+        self.layout_changed.emit()
+        return True
+
+    def grid_position_of(self, widget):
+        index = self._grid.indexOf(widget)
+        if index < 0:
+            return None
+        row, col, _rowspan, _colspan = self._grid.getItemPosition(index)
+        return row, col
+
+    def get_cell_at(self, global_pos):
+        for widget in (
+            *self._ctx.video_blocks,
+            *self._empty_cells,
+            self._info_label,
+        ):
+            if widget.isVisible() and widget.rect().contains(
+                widget.mapFromGlobal(global_pos)
+            ):
+                return widget
+        return None
+
+    def set_add_anchor(self, widget):
+        self._add_anchor = widget
+
+    def add_videos_to_layout(self, videos):
+        videos = list(videos)
+        if self._ctx.is_shuffle_on_load:
+            random.shuffle(videos)
+
+        anchor = self._add_anchor
+        self._add_anchor = None
+        if anchor is not None and getattr(anchor, "is_empty_cell", False):
+            self.cmd_layout_drop(videos, None, anchor, DropZone.CENTER, False)
+            return []
+
+        videos = self._clip_videos(videos)
+        if not videos:
+            return []
+
+        return self._ctx.commands.add_video_blocks(videos)
+
+    def _clip_videos(self, videos, is_replace=False):
+        cap = self._layout.free_capacity()
+        if cap is None:
+            return videos
+
+        if is_replace:
+            cap += 1
+
+        if len(videos) <= cap:
+            return videos
+
+        kept = videos[:cap]
+        extra = len(videos) - cap
+        self.warning.emit(
+            translate(
+                "Warning",
+                "Grid is full ({COLS}x{ROWS}). {COUNT} files were not added.",
+            )
+            .replace("{COLS}", str(self._grid_layout.max_cols))
+            .replace("{ROWS}", str(self._grid_layout.max_rows))
+            .replace("{COUNT}", str(extra))
+        )
+        return kept
+
+    def _block_at(self, row, col):
+        video_id = self._layout.id_at(row, col)
+        if not video_id:
+            return None
+        return self._ctx.video_blocks.by_video_id(video_id)
+
+    # --- mini window ---
+
+    def cmd_grid_layout_without_mini(self, video_id):
+        """Lay the grid out as if the floating cell were not in it.
+
+        The cell stays in the layout model -- it keeps its place for when it
+        comes back -- but is left out of what is drawn, so the others fill
+        the places it left: a 2x2 of four draws as a 3-cell auto grid.
+        """
+        self._mini_excluded = video_id
+        self._render_video_grid()
+
+    def cmd_grid_layout_with_mini_back(self):
+        self._mini_excluded = None
+        self._render_video_grid()
+
+    # --- Auto vs Fixed ---
+
+    def cmd_set_grid_mode(self, mode):
+        if self._mode == mode:
+            return
+
+        if mode == GridMode.FIXED:
+            self._ask_and_apply_fixed(include_preallocate=True)
+            return
+
+        if self._is_fixed and not self._leave_fixed():
+            return
+
+        self._mode = mode
+        self._flow.mode = _flow_mode(mode)
+        PlaylistSettings().set("playlist/grid_mode", mode)
+        self.layout_changed.emit()
+
+    def cmd_ask_grid_size(self):
+        size = QCustomSpinboxInput.get_int(
+            parent=self.parent(),
+            title=translate("Dialog - Set grid size", "Set grid size", "Header"),
+            special_text=translate("Grid Size", "Auto"),
+            initial_value=self._flow.size,
+            _min=0,
+            _max=1000,
+        )
+
+        if self._flow.size == size:
+            return
+
+        self._flow.size = size
+        PlaylistSettings().set("playlist/grid_size", size)
+        self.layout_changed.emit()
+
+    def cmd_get_grid_size(self):
+        if self._flow.size == 0:
+            return translate("Grid Size", "Auto")
+
+        return str(self._flow.size)
+
+    def cmd_switch_is_grid_fit(self):
+        self._flow.is_fit = not self._flow.is_fit
+        PlaylistSettings().set("playlist/grid_fit", self._flow.is_fit)
+        self.layout_changed.emit()
+
+    def cmd_get_fixed_grid_size(self):
+        return f"{self._grid_layout.max_cols}x{self._grid_layout.max_rows}"
+
+    def cmd_ask_fixed_grid_size(self):
+        self._ask_and_apply_fixed(include_preallocate=not self._is_fixed)
+
+    def cmd_switch_grid_preallocate(self):
+        if not self._is_fixed:
+            return
+        self._grid_layout.preallocate = not self._grid_layout.preallocate
+        if not self._grid_layout.preallocate:
+            self._grid_layout.compact_edges()
+        PlaylistSettings().set(
+            "playlist/grid_preallocate", self._grid_layout.preallocate
+        )
+        self.layout_changed.emit()
+
+    def cmd_shuffle_layout(self):
+        self._layout.shuffle()
+        self.layout_changed.emit()
+
+    def _ask_and_apply_fixed(self, include_preallocate=True):
+        if self._is_fixed:
+            rows, cols = self._grid_layout.max_rows, self._grid_layout.max_cols
+            preallocate = self._grid_layout.preallocate
+        else:
+            dims = self.grid_dimensions
+            rows, cols = dims.rows, dims.cols
+            preallocate = False
+
+        result = QFixedGridSizeDialog.get_size(
+            parent=self.parent(),
+            rows=rows,
+            cols=cols,
+            preallocate=preallocate,
+            include_preallocate=include_preallocate,
+        )
+        if result is None:
+            return False
+
+        new_rows, new_cols, new_preallocate = result
+        if not self._apply_fixed(new_rows, new_cols, new_preallocate):
+            return False
+
+        session = PlaylistSettings()
+        session.set("playlist/grid_mode", GridMode.FIXED)
+        session.set("playlist/grid_rows", new_rows)
+        session.set("playlist/grid_cols", new_cols)
+        if include_preallocate:
+            session.set("playlist/grid_preallocate", new_preallocate)
+        return True
+
+    def _apply_fixed(self, rows, cols, preallocate) -> bool:
+        if self._is_fixed:
+            return self._resize_fixed(rows, cols, preallocate)
+
+        live_set = set(self._ctx.video_blocks.video_ids)
+        ordered = [i for i in self._flow.order() if i in live_set]
+        ordered.extend(i for i in self._ctx.video_blocks.video_ids if i not in ordered)
+        extra_ids = ordered[rows * cols :]
+        keep_ids = ordered[: rows * cols]
+        if extra_ids and not self._confirm_overflow(rows * cols, len(extra_ids)):
+            return False
+
+        self._mode = GridMode.FIXED
+        self._grid_layout.max_rows = rows
+        self._grid_layout.max_cols = cols
+        self._grid_layout.preallocate = preallocate
+        self._grid_layout.pack_flow(keep_ids)
+        if extra_ids:
+            self._ctx.commands.remove_video_blocks(extra_ids)
+            return True
+
+        self.layout_changed.emit()
+        return True
+
+    def _resize_fixed(self, rows, cols, preallocate) -> bool:
+        snapshot = self._grid_layout.copy()
+        leftover = self._grid_layout.resize(rows, cols, preallocate)
+
+        if leftover:
+            if not self._confirm_overflow(rows * cols, len(leftover)):
+                self._grid_layout = snapshot
+                return False
+            self._ctx.commands.remove_video_blocks(leftover)
+            return True
+
+        self.layout_changed.emit()
+        return True
+
+    def _leave_fixed(self):
+        holes = self._grid_layout.empty_positions(preallocate=False)
+        if holes and self._ctx.video_blocks:
+            is_removed = QCustomMessageBox.confirm(
+                self.parent(),
+                translate("Dialog - Set grid size", "Set grid size", "Header"),
+                translate("Dialog - Set grid size", "Remove the empty cells?"),
+                translate("Dialog - Set grid size", "Remove"),
+                info=translate("Dialog - Set grid size", "Videos keep their order."),
+            )
+            if not is_removed:
+                return False
+
+        self._flow.ids = self._grid_layout.order()
+        self._grid_layout.cells = []
+        return True
+
+    def _confirm_overflow(self, capacity, count) -> bool:
+        return QCustomMessageBox.confirm(
+            self.parent(),
+            translate("Dialog - Set grid size", "Set grid size", "Header"),
+            translate("Dialog - Set grid size", "Close {COUNT} videos?").format(
+                COUNT=count_txt(count)
+            ),
+            translate("Dialog - Set grid size", "Close Videos"),
+            info=translate(
+                "Dialog - Set grid size", "This grid holds {CAPACITY} videos."
+            ).format(CAPACITY=count_txt(capacity)),
+            is_destructive=True,
+            icon=QMessageBox.Warning,
+        )
+
+    def _reconcile_layout(self):
+        live_set = set(self._ctx.video_blocks.video_ids)
+        for video_id in list(self._layout.order()):
+            if video_id not in live_set:
+                self._layout.remove(video_id)
+        new_ids = [
+            i for i in self._ctx.video_blocks.video_ids if not self._layout.contains(i)
+        ]
+        leftover = self._layout.add(new_ids)
+        if self._is_fixed:
+            self._grid_layout.compact_edges()
+        if leftover:
+            self._ctx.commands.remove_video_blocks(leftover)
+
+    # --- drop / move ---
+
+    def cmd_layout_drop(self, videos, src_block, dst, zone, is_replace):
+        dst_id = getattr(dst, "video_id", None) if dst is not None else None
+        row, col = None, None
+        # Empty cells have no id; only then ask the view for coordinates.
+        if dst is not None and dst_id is None:
+            pos = self.grid_position_of(dst)
+            if pos is not None:
+                row, col = pos
+
+        if src_block is not None:
+            self._drop_move(src_block, dst, row, col, zone, is_replace, dst_id)
+            return
+
+        self._drop_new(videos, dst, row, col, zone, is_replace, dst_id)
+
+    def _drop_move(self, src_block, dst, row, col, zone, is_replace, dst_id):
+        src_id = src_block.video_id
+        leftover = self._layout.drop(
+            [],
+            row,
+            col,
+            zone,
+            is_replace=is_replace,
+            src_id=src_id,
+            dst_id=dst_id,
+        )
+        if leftover:
+            self.warning.emit(
+                translate("Warning", "Cannot move the video in that direction.")
+            )
+            return
+
+        if is_replace and dst is not None and dst is not src_block:
+            self._ctx.commands.remove_video_blocks([dst.video_id])
+            return
+
+        self.layout_changed.emit()
+
+    def _drop_new(self, videos, dst, row, col, zone, is_replace, dst_id):
+        videos = self._clip_videos(
+            list(videos), is_replace=is_replace and dst is not None
+        )
+        if not videos:
+            return
+
+        if is_replace and dst is not None:
+            videos = self._replace_cell_video(dst, videos)
+            dst_id = dst.video_id
+            zone = DropZone.AFTER
+            if not videos:
+                self.layout_changed.emit()
+                return
+
+        self._place_dropped_ids(videos, row, col, zone, dst_id)
+
+    def _replace_cell_video(self, dst, videos):
+        old_id = dst.video_id
+        dst.set_video(videos[0])
+        self._ctx.video_blocks.reindex(dst)
+        self._layout.replace_id(old_id, dst.video_id)
+        return videos[1:]
+
+    def _place_dropped_ids(self, videos, row, col, zone, dst_id):
+        with self._ctx.commands.video_count_batch():
+            added = self._ctx.commands.add_video_blocks(videos)
+            ids = [vb.video_id for vb in added]
+            if not ids:
+                return
+
+            leftover = self._layout.drop(
+                ids, row, col, zone, is_replace=False, dst_id=dst_id
+            )
+            if leftover == ids:
+                self.warning.emit(
+                    translate("Warning", "Cannot add videos in that direction.")
+                )
+            if leftover:
+                self._ctx.commands.remove_video_blocks(leftover)
+
+    # --- render / layout ---
+
+    def on_single_mode_changed(self):
+        if self._ctx.is_single_mode:
+            # Hidden empties stay in the layout at size 0; un-hiding does not
+            # restore them. Take them out so the active video can fill, then
+            # rebuild on the way out.
+            self.adapt_grid()
+            return
+        self.layout_changed.emit()
+
+    def reload_video_grid(self):
+        # Count-changed fires before single mode exits. Skip until the grid
+        # is rebuilt with every cell visible.
+        if self._reloading or self._ctx.is_single_mode:
+            return
+        self._reloading = True
+        try:
+            self._reconcile_layout()
+            self._render_video_grid()
+        finally:
+            self._reloading = False
+
+    def adapt_grid(self, dims=None):
+        self._reset_grid_stretch()
+
+        if dims is None:
+            dims = self.grid_dimensions
+
+        show_stretch = not self._ctx.is_single_mode and dims.max_size > 1
+        if show_stretch:
+            self._adjust_grid_stretch(dims)
+
+        for empty in self._empty_cells:
+            empty.setVisible(not self._ctx.is_single_mode)
+
+    def _render_video_grid(self):
+        if self._ctx.is_single_mode:
+            return
+
+        dims = self._grid_dimensions_for_mini()
+
+        with self.slow_ui_operation(), self._laid_out_once():
+            self._reset_video_grid()
+
+            if not self._ctx.video_blocks and not self._show_empties:
+                return
+
+            if self._is_resizable:
+                placed = self._render_resizable(dims)
+            elif self._is_fixed:
+                placed = self._populate_fixed(dims)
+            else:
+                placed = self._populate_flow(dims)
+
+            self.adapt_grid(dims)
+            self._sync_block_visibility(placed)
+
+    def _grid_dimensions_for_mini(self):
+        """The size the grid is drawn at, with the floating cell left out.
+
+        A flow grid wraps its own cells, so one fewer is one fewer: the cells
+        are counted without it. A fixed grid keeps its shape, and shows a
+        hole where the floating cell was.
+        """
+        if self._mini_excluded is None or self._is_fixed:
+            return self.grid_dimensions
+
+        count = len(self._ctx.video_blocks) - 1
+        if count <= 0:
+            return self.grid_dimensions
+
+        flow = FlowLayout(
+            mode=self._flow.mode,
+            size=self._flow.size,
+            is_fit=self._flow.is_fit,
+            ids=[i for i in self._flow.ids if i != self._mini_excluded],
+        )
+        cols, rows = flow.displayed_size()
+        return GridDimensions(cols, rows)
+
+    def _render_resizable(self, dims):
+        """Draw the grid as nested splitters, so its seams can be dragged.
+
+        The cells come from the same layout the plain grid uses, so switching
+        the seams on rearranges nothing.
+        """
+        self._discard_splitters()
+
+        if self._is_fixed:
+            cells_at = lambda row, col: self._block_at(row, col)  # noqa: E731
+        else:
+            order = [i for i in self._flow.order() if i != self._mini_excluded]
+            widgets = self._ctx.video_blocks.blocks_for_ids(order)
+            by_id = {vb.video_id: vb for vb in widgets}
+
+            def cells_at(row, col):
+                idx = (
+                    col * dims.rows + row
+                    if self._flow.mode == FlowMode.COLS
+                    else row * dims.cols + col
+                )
+                if idx >= len(order):
+                    return None
+                return by_id.get(order[idx])
+
+        placed = self._build_splitters(dims, cells_at)
+        self._grid.addWidget(self._splitter_root, 0, 0)
+        self._splitter_root.show()
+        return placed
+
+    def _discard_splitters(self):
+        if self._splitter_root is not None:
+            self._grid.removeWidget(self._splitter_root)
+            self._splitter_root.setParent(None)
+            self._splitter_root.deleteLater()
+
+        self._clear_splitters()
+
+    def _reset_grid_stretch(self):
+        for c in range(self._grid.columnCount()):
+            self._grid.setColumnStretch(c, 0)
+
+        for r in range(self._grid.rowCount()):
+            self._grid.setRowStretch(r, 0)
+
+    def _adjust_grid_stretch(self, dims):
+        if self._is_resizable and self._splitter_root is not None:
+            # The one widget in the grid cell is the splitter tree; it takes
+            # the whole of it, and the seams inside divide it up.
+            self._grid.setColumnStretch(0, 1)
+            self._grid.setRowStretch(0, 1)
+            return
+
+        for c in range(dims.cols):
+            self._grid.setColumnStretch(c, 1)
+
+        for r in range(dims.rows):
+            self._grid.setRowStretch(r, 1)
+
+    # --- resizable seams ---
+
+    def cmd_toggle_grid_resizable(self):
+        self.set_grid_resizable(not self._is_resizable)
+
+    def set_grid_resizable(self, is_resizable: bool):
+        if is_resizable == self._is_resizable:
+            return
+
+        self._is_resizable = is_resizable
+        PlaylistSettings().set("playlist/grid_resizable", is_resizable)
+        self._render_video_grid()
+
+    def _splitter_sizes_state(self):
+        """The splits as ratios of their total, so they survive a window
+        resize: a splitter's own sizes are pixels, which mean nothing once
+        the window is a different size. Each entry is keyed by what the
+        splitter divides, as ``[kind, index]``, so a rebuilt tree can be
+        given its splits back."""
+        sizes = []
+
+        if self._splitter_root is not None:
+            sizes.append(("outer", self._ratios_of(self._splitter_root)))
+
+        for row, row_splitter in enumerate(self._splitter_rows):
+            sizes.append((f"row:{row}", self._ratios_of(row_splitter)))
+
+        return sizes
+
+    @staticmethod
+    def _ratios_of(splitter: GridSplitter) -> list[float]:
+        sizes = splitter.sizes()
+        total = sum(sizes)
+        if total <= 0:
+            # Not laid out yet -- a tree built before its window has a size
+            # reports every cell as nil. There is nothing to read back, so
+            # the splits are left as they are rather than written as zeroes.
+            return []
+        return [s / total for s in sizes]
+
+    def _apply_splitter_sizes_state(self, state):
+        if not self._is_resizable or not state:
+            return
+
+        by_key = dict(state)
+        self._is_syncing_splitters = True
+        try:
+            if self._splitter_root is not None and "outer" in by_key:
+                self._apply_ratios(self._splitter_root, by_key["outer"])
+
+            for row, row_splitter in enumerate(self._splitter_rows):
+                key = f"row:{row}"
+                if key in by_key:
+                    self._apply_ratios(row_splitter, by_key[key])
+        finally:
+            self._is_syncing_splitters = False
+
+    def _apply_ratios(self, splitter: GridSplitter, ratio: list[float]):
+        if not ratio or len(ratio) != splitter.count():
+            return
+
+        total = sum(splitter.sizes())
+        if total <= 0:
+            # The tree has not been laid out yet: a playlist reopened builds
+            # it before its window has a size, so every cell reports nil and
+            # there is no total to scale the splits against. QSplitter takes
+            # the sizes as weights and normalises them itself, so any total
+            # that keeps the ratios will do.
+            total = _UNREALIZED_SPLIT_TOTAL
+
+        sizes = [max(int(total * share), 1) for share in ratio]
+        sizes[-1] += total - sum(sizes)
+        splitter.setSizes(sizes)
+
+    def _clear_splitters(self):
+        self._splitter_rows = []
+        self._splitter_cols = []
+        self._splitter_root = None
+
+    def _build_splitters(self, dims, cells_at):
+        """Lay the cells out as nested splitters, one seam per row and column.
+
+        A row is an HBox of its cells with a seam between them; the rows are
+        stacked in a VBox with a seam between them. Dragging a seam resizes
+        the cells either side of it, the way a desktop's window tiling does.
+
+        ``cells_at`` gives the widget for a (row, col), or None for a hole.
+        Returns the widgets placed, as the grid render expects.
+        """
+        placed = set()
+        outer = GridSplitter(Qt.Vertical, parent=self.parent())
+        outer.setObjectName("grid-splitter-root")
+        outer.layout_changed.connect(self._on_splitter_moved)
+
+        row_splitters = []
+        for row in range(dims.rows):
+            row_splitter = GridSplitter(Qt.Horizontal, parent=outer)
+            row_splitter.layout_changed.connect(self._on_splitter_moved)
+
+            for col in range(dims.cols):
+                w = cells_at(row, col)
+                if w is None:
+                    continue
+                row_splitter.addWidget(w)
+                placed.add(w)
+
+            row_splitters.append(row_splitter)
+            outer.addWidget(row_splitter)
+
+        self._splitter_root = outer
+        self._splitter_rows = row_splitters
+        self._splitter_cols = []
+
+        if outer.count():
+            outer.setSizes([1] * outer.count())
+
+        return placed
+
+    def _on_splitter_moved(self):
+        # A cell resize mid-drag is what is wanted; nothing else follows from
+        # it. Sizes are read back from the tree when the state is saved.
+        if self._is_syncing_splitters:
+            return
+
+    def _discard_empty_cells(self):
+        for empty in self._empty_cells:
+            self._grid.removeWidget(empty)
+            empty.hide()
+            empty.deleteLater()
+        self._empty_cells = []
+
+    def _reset_video_grid(self):
+        self._info_label.hide()
+        self._discard_empty_cells()
+        self._discard_splitters()
+
+        _clear_layout(self._grid)
+
+        if not self._ctx.video_blocks and not self._show_empties:
+            self._grid.addWidget(self._info_label, 0, 0)
+            self._info_label.show()
+
+            self.adapt_grid()
+
+    def _sync_block_visibility(self, placed):
+        placed_set = set(placed)
+
+        # The floating cell is not among the placed: the grid deliberately
+        # draws without it, and it lives in the floating window instead. Left
+        # to this it would be taken for one with no place and hidden -- the
+        # window would come up empty, its video gone, on the very draw that
+        # turning mini mode on sets off (mode_changed -> reload_video_grid).
+        for vb in self._ctx.video_blocks:
+            if vb not in placed_set and vb.video_id != self._mini_excluded:
+                vb.hide()
+
+        coming = [
+            vb for vb in self._ctx.video_blocks if vb in placed_set and vb.isHidden()
+        ]
+        self._place_while_hidden(coming)
+        for vb in coming:
+            vb.show()
+
+    def _place_while_hidden(self, blocks):
+        """Lay out the cells about to be shown before they are on screen.
+
+        A hardware video's cell is a native window, and showing it puts it on
+        screen wherever it is at that point. The grid lays the cells out only
+        once they are all shown (see _laid_out_once), so a new cell came up
+        at the window's top left, 100x30, and was then moved into place. A
+        native window takes the pixels it covers along when it moves, so the
+        corner of the window, with the empty grid's outline in it, showed at
+        the top left of every new cell until the grid was painted.
+
+        A hidden cell is left out of the layout unless it keeps its space, so
+        each one keeps it for one pass, laid out with the rest as they all end
+        up.
+        """
+        if not blocks:
+            return
+
+        policies = [vb.sizePolicy() for vb in blocks]
+        for vb, policy in zip(blocks, policies):
+            kept = QSizePolicy(policy)
+            kept.setRetainSizeWhenHidden(True)
+            vb.setSizePolicy(kept)
+
+        was_enabled = self._grid.isEnabled()
+        self._grid.setEnabled(True)
+        self._grid.activate()
+        self._grid.setEnabled(was_enabled)
+
+        for vb, policy in zip(blocks, policies):
+            vb.setSizePolicy(policy)
+
+    def _populate_fixed(self, dims):
+        placed = set()
+
+        for row in range(dims.rows):
+            for col in range(dims.cols):
+                vb = self._block_at(row, col)
+                if (
+                    vb is not None
+                    and vb.video_id != self._mini_excluded
+                    and vb not in placed
+                ):
+                    self._grid.addWidget(vb, row, col, 1, 1)
+                    placed.add(vb)
+                    continue
+
+                empty = EmptyCell(parent=self.parent())
+                self._empty_cells.append(empty)
+                self._grid.addWidget(empty, row, col, 1, 1)
+
+        return placed
+
+    def _populate_flow(self, dims):
+        widgets = [
+            vb
+            for vb in self._ctx.video_blocks.blocks_for_ids(self._flow.order())
+            if vb.video_id != self._mini_excluded
+        ]
+        odd_cells = dims.max_size - len(widgets)
+
+        if odd_cells == 0 or not self._flow.is_fit:
+            self._fill_grid(widgets, dims)
+        elif self._flow.mode == FlowMode.COLS:
+            straight_cells = dims.rows * (dims.cols - 1)
+            self._fill_grid(widgets[:straight_cells], dims)
+            self._fill_last_col(widgets[straight_cells:], dims)
+        else:
+            straight_cells = dims.cols * (dims.rows - 1)
+            self._fill_grid(widgets[:straight_cells], dims)
+            self._fill_last_row(widgets[straight_cells:], dims)
+
+        return widgets
+
+    def _fill_grid(self, widgets, dims):
+        if self._flow.mode == FlowMode.COLS:
+            grid = ((col, row) for col in range(dims.cols) for row in range(dims.rows))
+        else:
+            grid = ((col, row) for row in range(dims.rows) for col in range(dims.cols))
+
+        for (col, row), w in zip(grid, widgets):
+            self._grid.addWidget(w, row, col, 1, 1)
+
+    def _fill_last_row(self, widgets, dims):
+        last_row = QHBoxLayout()
+
+        for w in widgets:
+            last_row.addWidget(w, 1)
+
+        self._grid.addLayout(last_row, dims.rows - 1, 0, 1, -1)
+
+    def _fill_last_col(self, widgets, dims):
+        last_col = QVBoxLayout()
+
+        for w in widgets:
+            last_col.addWidget(w, 1)
+
+        self._grid.addLayout(last_col, 0, dims.cols - 1, -1, 1)

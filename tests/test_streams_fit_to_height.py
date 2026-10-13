@@ -1,0 +1,121 @@
+"""Choosing a rung of the quality ladder by how big the pane showing it is."""
+
+import pytest
+
+from gridplayer.models.stream import Stream, Streams
+
+
+def _streams(*qualities, audio_only=()):
+    # a ladder runs from worst to best, which is where "best" comes from
+    return Streams(
+        {
+            quality: Stream(
+                url=f"http://host/{quality}",
+                protocol="http",
+                is_audio_only=quality in audio_only,
+            )
+            for quality in qualities
+        }
+    )
+
+
+LADDER = ("240p", "360p", "480p", "720p", "1080p")
+
+
+@pytest.mark.parametrize(
+    ("pane_height", "expected"),
+    [
+        (100, "240p"),
+        (240, "240p"),
+        (241, "360p"),
+        (500, "720p"),
+        (720, "720p"),
+        (1080, "1080p"),
+    ],
+)
+def test_the_cheapest_rung_that_still_fills_the_pane_is_picked(pane_height, expected):
+    quality, _ = _streams(*LADDER).fit_to_height(pane_height)
+
+    assert quality == expected
+
+
+def test_a_pane_taller_than_the_ladder_gets_the_best_there_is():
+    quality, _ = _streams(*LADDER).fit_to_height(2160)
+
+    assert quality == "1080p"
+
+
+def test_a_rung_is_matched_on_its_size_whatever_else_its_name_says():
+    streams = _streams("360p [avc1]", "720p60 [vp9]", "1080p60 [av01]")
+
+    quality, _ = streams.fit_to_height(700)
+
+    assert quality == "720p60 [vp9]"
+
+
+def test_a_rung_that_does_not_say_its_size_is_passed_over():
+    streams = _streams("Unknown 1", "480p", "Unknown 2")
+
+    quality, _ = streams.fit_to_height(400)
+
+    assert quality == "480p"
+
+
+def test_a_rung_named_by_its_bitrate_is_not_read_as_its_size():
+    # every one of these would fill any pane, read as a size, and the
+    # cheapest of them would always be picked
+    streams = _streams("1500k", "4500k", "9300k")
+
+    quality, _ = streams.fit_to_height(1080)
+
+    assert quality == "9300k"
+
+
+def test_a_rung_named_by_its_bitrate_is_passed_over_for_one_that_says_its_size():
+    streams = _streams("800k", "720p", "9300k")
+
+    quality, _ = streams.fit_to_height(700)
+
+    assert quality == "720p"
+
+
+def test_audio_only_rungs_are_not_offered_to_a_pane():
+    streams = _streams("audio", "360p", "720p", audio_only=("audio",))
+
+    quality, _ = streams.fit_to_height(300)
+
+    assert quality == "360p"
+
+
+def test_a_single_rung_is_the_only_answer_however_small_the_pane():
+    quality, _ = _streams("1080p").fit_to_height(50)
+
+    assert quality == "1080p"
+
+
+@pytest.mark.parametrize(
+    ("wanted", "expected"),
+    [
+        ("best", "1080p"),
+        ("worst", "240p"),
+        ("best_audio_only", "audio hi"),
+        ("worst_audio_only", "audio lo"),
+    ],
+)
+def test_a_stored_choice_is_still_understood_after_it_stopped_being_offered(
+    wanted, expected
+):
+    """The worst rungs left the menus, not the playlists already naming them.
+
+    Reading one of those as "best" would answer someone who asked for the
+    cheapest rung with the dearest one, which is the opposite of what they
+    picked it for.
+    """
+
+    streams = _streams(
+        "audio lo", "240p", "1080p", "audio hi", audio_only=("audio lo", "audio hi")
+    )
+
+    quality, _ = streams.by_quality(wanted)
+
+    assert quality == expected

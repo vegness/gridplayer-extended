@@ -1,0 +1,150 @@
+#!/bin/bash
+
+die() {
+    printf '%s\n' "$*" >&2
+    exit 1
+}
+
+if ! command -v realpath &> /dev/null; then
+    realpath() {
+        [[ $1 = /* ]] && echo "$1" || echo "$PWD/${1#./}"
+    }
+fi
+
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    command -v gsed >/dev/null 2>&1 || die "gsed is required on macOS. Run ./scripts/macos/_init_local_env.sh"
+
+    sed() {
+        command gsed "$@"
+    }
+fi
+
+normalize_macos_arch() {
+    case "$1" in
+        arm64)
+            printf '%s\n' "arm64"
+            ;;
+        x86_64|intel64)
+            printf '%s\n' "x86_64"
+            ;;
+        *)
+            die "Unsupported macOS architecture: $1"
+            ;;
+    esac
+}
+
+macos_arch_suffix() {
+    case "$1" in
+        arm64)
+            printf '%s\n' "arm64"
+            ;;
+        x86_64)
+            printf '%s\n' "intel64"
+            ;;
+        *)
+            die "Unsupported macOS architecture: $1"
+            ;;
+    esac
+}
+
+replace_app_vars() {
+    TARGET_FILE="$1"
+
+    [ ! -f "$TARGET_FILE" ] && return
+
+    VARS=$(env | cut -d '=' -f1 | grep "^APP_")
+
+    while IFS= read -r var; do
+        eval replace='$'$var
+
+        [ -z "$replace" ] && die "$var variable is empty!"
+
+        sed -i "s#{$var}#$replace#g" "$TARGET_FILE"
+    done <<< "$VARS"
+}
+
+copy_with_app_vars() {
+    SOURCE_FILE="$1"
+    DESTINATION="$2"
+
+    if [ -d "$DESTINATION" ]; then
+        DEST_FILE="$(realpath $DESTINATION)/$(basename $SOURCE_FILE)"
+    else
+        DEST_FILE="$DESTINATION"
+    fi
+
+    cp "$SOURCE_FILE" "$DEST_FILE"
+    replace_app_vars "$DEST_FILE"
+}
+
+init_venv() {
+    VENV_DIR="$1"
+
+    if [ ! -d "$VENV_DIR" ]; then
+        python3 -m venv "$VENV_DIR"
+
+        activate_venv "$VENV_DIR"
+
+        python3 -m pip install --upgrade pip
+    else
+        activate_venv "$VENV_DIR"
+    fi
+}
+
+activate_venv() {
+    VENV_DIR="$1"
+
+    if [ -f "$VENV_DIR/Scripts/activate" ]; then
+        . "$VENV_DIR/Scripts/activate"
+    else
+        . "$VENV_DIR/bin/activate"
+    fi
+}
+
+export ROOT_DIR="$(realpath $(pwd))"
+
+export RESOURCES_DIR="$ROOT_DIR/resources"
+export BUILD_DIR="$ROOT_DIR/build"
+export DIST_DIR="$ROOT_DIR/dist"
+export SCRIPTS_DIR="$ROOT_DIR/scripts"
+
+export APP_MODULE="gridplayer"
+export APP_BASE_DIR=$(realpath "./$APP_MODULE")
+export APP_REPO_SLUG="vegness/gridplayer-extended"
+
+export APP_DISP_NAME=$(sed -n 's/__display_name__ = "\([^"]*\).*/\1/p' "$APP_BASE_DIR/version.py")
+export APP_NAME=$(sed -n 's/__app_name__ = "\([^"]*\).*/\1/p' "$APP_BASE_DIR/version.py")
+export APP_ID=$(sed -n 's/__app_id__ = "\([^"]*\).*/\1/p' "$APP_BASE_DIR/version.py")
+export APP_VERSION=$(sed -n 's/__version__ = "\([^"]*\).*/\1/p' "$APP_BASE_DIR/version.py")
+export APP_VERSION_DATE=$(sed -n 's/__version_date__ = "\([^"]*\).*/\1/p' "$APP_BASE_DIR/version.py")
+export APP_AUTHOR=$(sed -n 's/__author_name__ = "\([^"]*\).*/\1/p' "$APP_BASE_DIR/version.py")
+export APP_AUTHOR_CONTACT=$(sed -n 's/__author_contact__ = "\([^"]*\).*/\1/p' "$APP_BASE_DIR/version.py")
+export APP_URL=$(sed -n 's/__app_url__ = "\([^"]*\).*/\1/p' "$APP_BASE_DIR/version.py")
+export APP_BUGTRACKER_URL=$(sed -n 's/__app_bugtracker_url__ = "\([^"]*\).*/\1/p' "$APP_BASE_DIR/version.py")
+
+[[ "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || die "Cannot parse version: $APP_VERSION"
+
+# X.Y.Z alone, for the version fields that take nothing but numbers
+export APP_VERSION_NUMERIC="${BASH_REMATCH[0]}"
+
+# A dev snapshot (see scripts/stamp_dev_version.py) gets fixed file names,
+# so the download links of the "continuous" pre-release never change,
+# notes from the unreleased changes, and AppImage updates from that
+# pre-release rather than from the latest stable release
+if [[ "$APP_VERSION" == *.dev.* ]]; then
+    export APP_FILE_VERSION="dev"
+    export APP_CHANGELOG_VERSION="unreleased"
+    export APP_UPDATE_RELEASE="continuous"
+else
+    export APP_FILE_VERSION="$APP_VERSION"
+    export APP_CHANGELOG_VERSION="$APP_VERSION"
+    export APP_UPDATE_RELEASE="latest"
+fi
+
+# a dev snapshot has no tag of its own, it borrows the last release's
+export APP_CDN_URL_ROOT="https://cdn.jsdelivr.net/gh/${APP_REPO_SLUG}@v${APP_VERSION_NUMERIC}"
+
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    export APP_TARGET_ARCH=$(normalize_macos_arch "${BUILD_MACOS_ARCH:-arm64}")
+    export APP_TARGET_ARCH_SUFFIX=$(macos_arch_suffix "$APP_TARGET_ARCH")
+fi

@@ -1,0 +1,436 @@
+import random
+from dataclasses import dataclass, field
+from enum import Enum, auto
+
+from gridplayer.models.audio_device import AudioDevice
+from gridplayer.models.audio_selection import (
+    AudioDefault,
+    AudioDisabled,
+    AudioLanguage,
+    AudioTrackId,
+)
+from gridplayer.models.chapter import Chapter
+from gridplayer.models.subtitle_selection import (
+    SubtitleDefault,
+    SubtitleDisabled,
+    SubtitleLanguage,
+    SubtitleTrackId,
+)
+from gridplayer.models.video import Video
+from gridplayer.params.static import ROTATION_TRANSFORMS, VideoTransform
+from gridplayer.utils.track_language import pick_track
+
+DISABLED_TRACK = -1
+NO_TRACK = frozenset((None, DISABLED_TRACK))
+
+# How much of the video the time has to give up at once to count as a finished
+# pass. A stream reports its time a few ms backwards now and then all on its
+# own, and an eighth of the length sits far above that and far below what
+# starting over really hands back.
+LOOP_WRAP_DROP_FRACTION = 8
+
+# A seek lands on the keyframe before where it was aimed and decodes its way
+# to the aim from there, and VLC reports the time it landed on meanwhile: a
+# hair short on a file, but seconds short on a stream, where it lands on the
+# start of a segment -- up to 10.5s, measured on YouTube. This far short of
+# where a seek was aimed, the video still counts as on its way there.
+SEEK_LANDING_MS = 20000
+
+# How far past where a seek was aimed it can first be seen and still be that
+# seek arriving, at normal speed: VLC comes out of one a few hundred ms on,
+# measured on YouTube. A faster rate covers more ground between two reports.
+SEEK_ARRIVAL_MS = 5000
+
+# A seek that landed short sits where it landed until it has decoded its way
+# to the aim. Seen this far from there, it has done with landing: playing on
+# from where it landed, or gone round from the end of a short video.
+SEEK_LANDED_MOVE_MS = 1000
+
+
+class SeekLanding(Enum):
+    # the aim repeated back, or short of it on the way there
+    LANDING = auto()
+    # just past the aim, or playing on from where it landed short
+    ARRIVED = auto()
+    # nowhere this seek could have taken the video
+    ASTRAY = auto()
+
+
+def is_loop_wrapped(last_time: int | None, new_time: int, length: int) -> bool:
+    """Whether the time falling this far back means another pass has begun.
+
+    A pass that came to an end leaves no event behind: VLC loops the input
+    without ending the media, and where the media does end and the item is
+    played again, that is the player's own business. What both have in common
+    is the time dropping back to the beginning.
+    """
+
+    if last_time is None or length <= 0:
+        return False
+
+    return last_time - new_time > length / LOOP_WRAP_DROP_FRACTION
+
+
+def arriving_time(time_ms: int, seek_target: int | None) -> int:
+    """Where the video is, a seek still on its way counting as there already.
+
+    The target is where the last seek was aimed, for as long as the time has
+    not been seen past it.
+    """
+
+    if seek_target is not None and 0 <= seek_target - time_ms <= SEEK_LANDING_MS:
+        return seek_target
+
+    return time_ms
+
+
+def seek_landing(
+    time_ms: int, seek_target: int, landed_ms: int | None, rate: float
+) -> SeekLanding:
+    """What a time reported after a seek says about how the seek is going.
+
+    landed_ms is the first time reported short of the aim, if one was.
+    """
+
+    if time_ms == seek_target:
+        return SeekLanding.LANDING
+
+    if 0 < time_ms - seek_target <= SEEK_ARRIVAL_MS * max(rate, 1):
+        return SeekLanding.ARRIVED
+
+    if 0 < seek_target - time_ms <= SEEK_LANDING_MS:
+        if landed_ms is None or abs(time_ms - landed_ms) <= SEEK_LANDED_MOVE_MS:
+            return SeekLanding.LANDING
+
+        if time_ms > landed_ms:
+            return SeekLanding.ARRIVED
+
+    return SeekLanding.ASTRAY
+
+
+def wanted_audio_track_id(video, tracks: dict):
+    """Which of these tracks a video's settings call for, None for any.
+
+    Both the load and a switch made while playing have to answer this the
+    same way, or the track would change under the viewer the next time
+    anything reloaded. A pick of a file of the video's own is not answered
+    here: only whoever knows which track each file brought can answer it.
+
+    A pick that these tracks cannot honour -- a language this source does
+    not carry, an id it no longer has -- falls back to the preference,
+    which is what the viewer would be left with had they picked nothing.
+    """
+
+    selection = video.audio_selection
+
+    if isinstance(selection, AudioDisabled):
+        return DISABLED_TRACK
+
+    if isinstance(selection, AudioDefault):
+        # nothing is asked of libVLC, so it opens on whichever track the
+        # file itself puts forward
+        return None
+
+    if isinstance(selection, AudioLanguage):
+        picked = pick_track(selection.tag, tracks)
+
+        if picked is not None:
+            return picked
+
+    if isinstance(selection, AudioTrackId) and selection.id in tracks:
+        return selection.id
+
+    return pick_track(video.audio_languages, tracks)
+
+
+def wanted_subtitle_track_id(video, tracks: dict, external_ids=()):
+    """Which of these tracks a video's settings call for, None to leave be.
+
+    Where the sound gives up and takes whatever it can get, this gives up
+    and shows nothing: a track in a language nobody asked for is worse than
+    a bare picture, which is not true of a sound track nobody asked for.
+
+    Tracks a file of their own brought are kept out of the language
+    matching. libVLC writes that file's name where an embedded track's
+    language goes, so matching against them is matching against a path.
+    A pick of one is not answered here at all: only whoever knows which
+    track came out of which file can answer that.
+    """
+
+    selection = video.subtitle_selection
+
+    if isinstance(selection, SubtitleDisabled):
+        return DISABLED_TRACK
+
+    if isinstance(selection, SubtitleDefault):
+        # nothing is asked of libVLC, so what it opened on stands, and that
+        # is whichever track the container marks
+        return None
+
+    if isinstance(selection, SubtitleTrackId) and selection.id in tracks:
+        return selection.id
+
+    own_tracks = {
+        track_id: track
+        for track_id, track in tracks.items()
+        if track_id not in external_ids
+    }
+
+    if isinstance(selection, SubtitleLanguage):
+        picked = pick_track(selection.tag, own_tracks)
+
+        if picked is not None:
+            return picked
+
+    picked = pick_track(video.subtitle_languages, own_tracks)
+
+    return DISABLED_TRACK if picked is None else picked
+
+
+@dataclass
+class MediaTrack:
+    codec: str
+    bitrate: int
+    language: str | None
+    description: str | None
+
+    @property
+    def codec_info(self):
+        info = [self.codec]
+
+        if self.bitrate:
+            info += [f"{self.bitrate // 1024} kbps"]
+
+        return ", ".join(info)
+
+    @property
+    def info(self):
+        info = [self.codec_info]
+
+        if self.language and self.description:
+            info += [f"{self.language} ({self.description})"]
+        else:
+            if self.language:
+                info += [f"{self.language}"]
+
+            if self.description:
+                info += [f"{self.description}"]
+
+        return ", ".join(info)
+
+
+@dataclass
+class VideoTrack(MediaTrack):
+    video_dimensions: tuple[int, int]
+    fps: float | None
+    # What the file says to turn or flip it by to show it, as a phone
+    # records it, and VLC does as it shows it.
+    orientation: VideoTransform = VideoTransform.NONE
+
+    @property
+    def is_turned(self) -> bool:
+        """Shown on its side: video_dimensions the other way round."""
+
+        return self.orientation in ROTATION_TRANSFORMS
+
+    @property
+    def is_reoriented(self) -> bool:
+        """Turned or flipped at all, which VLC 3 crops wrong on hardware
+        output; see calc_whole_placement."""
+
+        return self.orientation != VideoTransform.NONE
+
+    @property
+    def codec_info(self):
+        info = [self.codec]
+
+        if all(self.video_dimensions):
+            info += ["{}x{}".format(*self.video_dimensions)]
+
+        if self.fps:
+            info += [f"{self.fps} FPS"]
+
+        if self.bitrate:
+            info += [f"{self.bitrate // 1024} kbps"]
+
+        return ", ".join(info)
+
+
+@dataclass
+class AudioTrack(MediaTrack):
+    channels: int
+    rate: int
+
+    @property
+    def codec_info(self):
+        info = [self.codec]
+
+        if self.channels:
+            info += [f"{self.channels} ch"]
+
+        if self.rate:
+            info += [f"{self.rate // 1000} kHz"]
+
+        if self.bitrate:
+            info += [f"{self.bitrate // 1024} kbps"]
+
+        return ", ".join(info)
+
+
+@dataclass
+class SubtitleTrack(MediaTrack):
+    """One subtitle track, whether the video carried it or a file brought it.
+
+    ``bitrate`` is nothing here -- libVLC reports zero for every subtitle
+    track -- so the codec and the encoding are all there is to show.
+    """
+
+    encoding: str | None = None
+
+    @property
+    def codec_info(self):
+        info = [self.codec]
+
+        if self.encoding:
+            info += [self.encoding]
+
+        return ", ".join(info)
+
+
+@dataclass
+class Media:
+    length: int
+
+    video_tracks: dict[int, VideoTrack]
+    audio_tracks: dict[int, AudioTrack]
+
+    cur_audio_track_id: int | None = None
+    cur_video_track_id: int | None = None
+
+    # the tracks that came out of the file attached to this video, in the
+    # order libVLC put them in
+    external_audio_ids: tuple[int, ...] = ()
+
+    # the track libVLC opened on before anything was asked of it, which is
+    # the one the file itself puts forward
+    default_audio_track_id: int | None = None
+
+    # Subtitles. Defaulted, unlike the picture and the sound, since a media
+    # that has none is the ordinary case rather than a broken one.
+    subtitle_tracks: dict[int, SubtitleTrack] = field(default_factory=dict)
+    cur_subtitle_track_id: int | None = None
+
+    # the tracks the subtitle files brought, in the order they were opened
+    external_subtitle_ids: tuple[int, ...] = ()
+
+    # the track libVLC would have shown had it been left alone, which is
+    # the one the container marks default or forced
+    default_subtitle_track_id: int | None = None
+
+    # Audio devices. Every way out of the machine the output module in
+    # force can reach, read per player rather than per media: the list
+    # belongs to the process, and riding along here saves the window a
+    # VLC instance of its own to ask.
+    audio_devices: tuple[AudioDevice, ...] = ()
+
+    # The chapters of the title that is playing, as the file lists them.
+    # libVLC only has them once the input is running, not from the preparse,
+    # and a file can list more as it plays, so they can also arrive after
+    # the load; see VlcPlayerBase.cb_title_changed.
+    chapters: tuple[Chapter, ...] = ()
+
+    @property
+    def is_live(self) -> bool:
+        return self.length == -1
+
+    @property
+    def is_audio_only(self) -> bool:
+        return not self.video_tracks or self.cur_video_track_id == DISABLED_TRACK
+
+    @property
+    def cur_video_track(self):
+        if self.cur_video_track_id in NO_TRACK:
+            return None
+        return self.video_tracks[self.cur_video_track_id]
+
+    @property
+    def cur_audio_track(self):
+        if self.cur_audio_track_id in NO_TRACK:
+            return None
+        return self.audio_tracks[self.cur_audio_track_id]
+
+    @property
+    def cur_subtitle_track(self):
+        if self.cur_subtitle_track_id in NO_TRACK:
+            return None
+        return self.subtitle_tracks.get(self.cur_subtitle_track_id)
+
+    @property
+    def has_subtitles(self) -> bool:
+        """Whether there is anything to show, picture to show it on included.
+
+        A track with the video switched off has nowhere to be drawn: VLC
+        blends subtitles into the picture, and without one there is no
+        video output to blend into.
+        """
+
+        return bool(self.subtitle_tracks) and not self.is_audio_only
+
+
+@dataclass
+class MediaInput:
+    uri: str
+    is_live: bool
+    is_audio_only: bool
+    size: tuple[int, int]
+    video: Video
+
+    video_codec: str | None = None
+    is_adaptive: bool = False
+    length: int | None = None
+
+    # the audio file to open along with the video, where one was picked.
+    # Only ever one: libVLC never says which stream came from which file,
+    # so a second would leave the two of them to be told apart by guesswork.
+    selected_audio_slave: str | None = None
+
+    # the subtitle files to open along with the video, in the order they
+    # were picked. Several is allowed here where audio gets one: libVLC
+    # opens each as a track of its own and writes the file's name into the
+    # track description, so which came from where is never in doubt.
+    selected_subtitle_slaves: tuple[str, ...] = ()
+
+    # what a link handed straight to VLC is fetched with, a channel list's
+    # user agent and referrer; VLC's http access takes those two and no more
+    http_headers: dict[str, str] = field(default_factory=dict)
+
+    _initial_seek_ms: int | None = None
+
+    @property
+    def initial_time(self) -> int:
+        if self._initial_seek_ms is None:
+            is_video_start = self.video.current_position == 0
+
+            if not self.is_live and is_video_start and self.video.is_start_random:
+                self._initial_seek_ms = self._get_random_position()
+            else:
+                self._initial_seek_ms = self.video.current_position
+
+        return self._initial_seek_ms
+
+    @initial_time.setter
+    def initial_time(self, initial_seek_ms: int):
+        self._initial_seek_ms = initial_seek_ms
+
+    def _get_random_position(self) -> int:
+        if self.length is None:
+            raise ValueError("Length is not set")
+
+        loop_start = self.video.loop_start or 0
+        loop_end = self.video.loop_end or self.length
+
+        return random.randint(loop_start, loop_end)
+
+
+class NotPausedError(Exception):
+    """Exception risen when video didn't pause at the beginning"""

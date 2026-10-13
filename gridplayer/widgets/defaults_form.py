@@ -1,0 +1,375 @@
+from PyQt5.QtCore import QSize, Qt, pyqtSignal
+from PyQt5.QtGui import QColor, QIcon
+from PyQt5.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QSizePolicy,
+    QSpinBox,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+from gridplayer.dialogs.crop import QCompactCropPicker
+from gridplayer.params.defaults_fields import FieldKind, GridVisibility, SettingField
+from gridplayer.params.static import GridMode
+from gridplayer.utils.qt import translate
+from gridplayer.widgets.color_palette import QCompactColorPicker
+from gridplayer.widgets.combo_box import cap_popup_height
+
+
+def _fill_combo(combo: QComboBox, values: dict) -> None:
+    combo.clear()
+    for value, name in values.items():
+        combo.addItem(name, value)
+
+
+def _set_combo(combo: QComboBox, value) -> None:
+    idx = combo.findData(value)
+    combo.setCurrentIndex(idx if idx >= 0 else 0)
+
+
+class DefaultsForm(QWidget):
+    """Shared Playlist/Video defaults form. Optional per-row reset chrome."""
+
+    values_changed = pyqtSignal()
+
+    def __init__(
+        self,
+        fields: tuple[SettingField, ...],
+        show_reset: bool = False,
+        default_getter=None,
+    ):
+        super().__init__()
+        self._fields = fields
+        self._show_reset = show_reset
+        self._default_getter = default_getter
+        self._widgets: dict[str, QWidget] = {}
+        self._labels: dict[str, QWidget] = {}
+        self._rows: dict[str, QWidget] = {}
+        self._reset_btns: dict[str, QToolButton] = {}
+        self._overridden: set[str] = set()
+        self._updating = False
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(6)
+
+        current_section = None
+        for spec in fields:
+            if spec.section != current_section:
+                current_section = spec.section
+                if spec.section:
+                    header = QLabel(spec.section)
+                    font = header.font()
+                    font.setBold(True)
+                    header.setFont(font)
+                    root.addWidget(header)
+            root.addWidget(self._make_row(spec))
+
+        root.addStretch(1)
+        self._sync_enabled()
+        self._sync_grid_visibility()
+
+    def _make_row(self, spec: SettingField) -> QWidget:
+        holder = QWidget()
+        lay = QHBoxLayout(holder)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+
+        if spec.kind is FieldKind.CHECKBOX:
+            widget = QCheckBox(spec.label)
+            widget.stateChanged.connect(self._on_edited)
+            self._labels[spec.settings_key] = widget
+            lay.addWidget(widget, alignment=Qt.AlignVCenter)
+        elif spec.kind is FieldKind.COMBO:
+            label = QLabel(spec.label)
+            self._labels[spec.settings_key] = label
+            lay.addWidget(label)
+            widget = QComboBox()
+            values = spec.combo_values()
+            _fill_combo(widget, values)
+            cap_popup_height(widget, len(values))
+            widget.currentIndexChanged.connect(self._on_edited)
+            lay.addWidget(widget)
+        elif spec.kind is FieldKind.TEXT:
+            label = QLabel(spec.label)
+            self._labels[spec.settings_key] = label
+            lay.addWidget(label)
+            widget = QLineEdit()
+            widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            if spec.text_placeholder:
+                widget.setPlaceholderText(spec.text_placeholder)
+            widget.textChanged.connect(self._on_edited)
+            lay.addWidget(widget)
+        elif spec.kind is FieldKind.SPIN:
+            label = QLabel(spec.label)
+            self._labels[spec.settings_key] = label
+            lay.addWidget(label)
+            widget = QSpinBox()
+            widget.setRange(spec.spin_min, spec.spin_max)
+            if spec.spin_special is not None:
+                widget.setSpecialValueText(spec.spin_special)
+            widget.valueChanged.connect(self._on_edited)
+            lay.addWidget(widget)
+            if spec.spin_suffix:
+                lay.addWidget(QLabel(spec.spin_suffix))
+        elif spec.kind is FieldKind.FLOAT_SPIN:
+            label = QLabel(spec.label)
+            self._labels[spec.settings_key] = label
+            lay.addWidget(label)
+            widget = QDoubleSpinBox()
+            widget.setRange(spec.spin_min, spec.spin_max)
+            widget.setDecimals(spec.spin_decimals)
+            widget.setSingleStep(spec.spin_step)
+            if spec.spin_special is not None:
+                widget.setSpecialValueText(spec.spin_special)
+            widget.valueChanged.connect(self._on_edited)
+            lay.addWidget(widget)
+            if spec.spin_suffix:
+                lay.addWidget(QLabel(spec.spin_suffix))
+        elif spec.kind is FieldKind.CROP:
+            label = QLabel(spec.label)
+            self._labels[spec.settings_key] = label
+            lay.addWidget(label)
+            widget = QCompactCropPicker()
+            widget.setObjectName(spec.settings_key)
+            widget.value_changed.connect(self._on_edited)
+            lay.addWidget(widget)
+        elif spec.kind is FieldKind.COLOR:
+            label = QLabel(spec.label)
+            self._labels[spec.settings_key] = label
+            lay.addWidget(label)
+            widget = QCompactColorPicker()
+            widget.setObjectName(spec.settings_key)
+            widget.color_changed.connect(self._on_edited)
+            lay.addWidget(widget)
+        else:
+            raise ValueError(f"Unknown field kind {spec.kind}")
+
+        widget.setObjectName(spec.settings_key)
+        self._widgets[spec.settings_key] = widget
+
+        if spec.tooltip:
+            holder.setToolTip(spec.tooltip)
+
+        if self._show_reset:
+            reset = QToolButton()
+            reset.setIcon(QIcon.fromTheme("reset"))
+            reset.setIconSize(QSize(14, 14))
+            reset.setAutoRaise(True)
+            reset.setToolTip(translate("SettingsDialog", "Reset"))
+            reset.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            reset.clicked.connect(
+                lambda _=False, key=spec.settings_key: self._on_reset(key)
+            )
+            self._reset_btns[spec.settings_key] = reset
+            lay.addWidget(reset, alignment=Qt.AlignVCenter)
+            # Keep the row as tall as with the reset button shown. The reset
+            # button is still counted here, and taller fields (the color
+            # swatch) set the height themselves.
+            holder.setMinimumHeight(lay.minimumSize().height())
+            reset.hide()
+
+        lay.addStretch(1)
+        self._rows[spec.settings_key] = holder
+        return holder
+
+    def _on_edited(self, *_args):
+        if self._updating:
+            return
+        sender = self.sender()
+        if sender is not None:
+            self._overridden.add(sender.objectName())
+        self._sync_enabled()
+        self._sync_grid_visibility()
+        self._sync_modified()
+        self.values_changed.emit()
+
+    def _spec_for_key(self, key: str) -> SettingField | None:
+        for spec in self._fields:
+            if spec.settings_key == key:
+                return spec
+        return None
+
+    def _on_reset(self, key: str):
+        spec = self._spec_for_key(key)
+        self._overridden.discard(key)
+        if self._default_getter is not None and spec is not None:
+            self._updating = True
+            try:
+                self._set_widget(spec, self._default_getter(spec.settings_key))
+            finally:
+                self._updating = False
+        self._sync_enabled()
+        self._sync_grid_visibility()
+        self._sync_modified()
+        self.values_changed.emit()
+
+    def set_values(self, values: dict, overridden: set[str] | None = None):
+        self._updating = True
+        try:
+            for spec in self._fields:
+                if spec.settings_key in values:
+                    self._set_widget(spec, values[spec.settings_key])
+            self._overridden = set(overridden or [])
+        finally:
+            self._updating = False
+        self._sync_enabled()
+        self._sync_grid_visibility()
+        self._sync_modified()
+
+    def values(self) -> dict:
+        return {spec.settings_key: self._get_widget(spec) for spec in self._fields}
+
+    def overridden_keys(self) -> set[str]:
+        return set(self._overridden)
+
+    def mark_all_overridden(self):
+        self._overridden = {spec.settings_key for spec in self._fields}
+        self._sync_modified()
+
+    def clear_overridden(self):
+        self._overridden = set()
+        self._sync_modified()
+
+    def apply_defaults(self, defaults: dict):
+        self._updating = True
+        try:
+            for spec in self._fields:
+                if (
+                    spec.settings_key not in self._overridden
+                    and spec.settings_key in defaults
+                ):
+                    self._set_widget(spec, defaults[spec.settings_key])
+        finally:
+            self._updating = False
+        self._sync_enabled()
+        self._sync_grid_visibility()
+
+    def is_enabled(self, key: str) -> bool:
+        widget = self._widgets.get(key)
+        return widget is not None and widget.isEnabled()
+
+    def _set_widget(self, spec: SettingField, value):
+        widget = self._widgets[spec.settings_key]
+        if spec.kind is FieldKind.CHECKBOX:
+            widget.setChecked(
+                value == spec.checked_value
+                if spec.checked_value is not None
+                else bool(value)
+            )
+        elif spec.kind is FieldKind.COMBO:
+            _set_combo(widget, value)
+        elif spec.kind is FieldKind.TEXT:
+            widget.setText(str(value or ""))
+        elif spec.kind is FieldKind.SPIN:
+            widget.setValue(int(value))
+        elif spec.kind is FieldKind.FLOAT_SPIN:
+            widget.setValue(float(value))
+        elif spec.kind is FieldKind.CROP:
+            widget.value = value
+        elif spec.kind is FieldKind.COLOR:
+            widget.color = QColor(str(value)).getRgb()[:3]
+
+    def _get_widget(self, spec: SettingField):
+        widget = self._widgets[spec.settings_key]
+        if spec.kind is FieldKind.CHECKBOX:
+            if spec.checked_value is None:
+                return widget.isChecked()
+
+            return spec.checked_value if widget.isChecked() else spec.unchecked_value
+        if spec.kind is FieldKind.COMBO:
+            return widget.currentData()
+        if spec.kind is FieldKind.TEXT:
+            return widget.text()
+        if spec.kind is FieldKind.SPIN:
+            return widget.value()
+        if spec.kind is FieldKind.FLOAT_SPIN:
+            return widget.value()
+        if spec.kind is FieldKind.CROP:
+            return widget.value
+        if spec.kind is FieldKind.COLOR:
+            return widget.color.name(QColor.HexRgb)
+        raise ValueError(spec.kind)
+
+    def _sync_enabled(self):
+        for spec in self._fields:
+            if not spec.enabled_by:
+                continue
+            driver = self._widgets.get(spec.enabled_by)
+            widget = self._widgets.get(spec.settings_key)
+            if driver is None or widget is None:
+                continue
+            driver_spec = self._spec_for_key(spec.enabled_by)
+            if driver_spec is None:
+                continue
+
+            driver_value = self._get_widget(driver_spec)
+
+            if spec.enabled_by_value is None:
+                enabled = bool(driver_value)
+            elif isinstance(spec.enabled_by_value, tuple):
+                enabled = driver_value in spec.enabled_by_value
+            else:
+                enabled = driver_value == spec.enabled_by_value
+
+            self._set_enabled(spec, enabled)
+
+    def _set_enabled(self, spec: SettingField, enabled: bool) -> None:
+        widget = self._widgets.get(spec.settings_key)
+
+        if widget is None:
+            return
+
+        widget.setEnabled(enabled)
+
+        if spec.kind is FieldKind.TEXT and spec.text_placeholder:
+            # greyed out, an example of what could go here is indistinguishable
+            # from a greyed out value that somebody put here
+            widget.setPlaceholderText(spec.text_placeholder if enabled else "")
+
+        label = self._labels.get(spec.settings_key)
+
+        if label is not None:
+            label.setEnabled(enabled)
+
+    def _sync_grid_visibility(self):
+        mode_widget = self._widgets.get("playlist/grid_mode")
+        if mode_widget is None:
+            return
+        is_fixed = mode_widget.currentData() == GridMode.FIXED
+        for spec in self._fields:
+            if spec.grid_visibility is GridVisibility.ALWAYS:
+                continue
+            visible = (
+                is_fixed
+                if spec.grid_visibility is GridVisibility.FIXED_ONLY
+                else not is_fixed
+            )
+            row = self._rows.get(spec.settings_key)
+            if row is not None:
+                row.setVisible(visible)
+            if spec.enabled_by:
+                # enabled_by owns enablement for such fields; keep them orthogonal.
+                continue
+
+            self._set_enabled(spec, visible)
+
+    def _sync_modified(self):
+        if not self._show_reset:
+            return
+        for spec in self._fields:
+            is_over = spec.settings_key in self._overridden
+            label = self._labels.get(spec.settings_key)
+            if label is not None:
+                font = label.font()
+                font.setItalic(is_over)
+                label.setFont(font)
+            reset = self._reset_btns.get(spec.settings_key)
+            if reset is not None:
+                reset.setVisible(is_over)

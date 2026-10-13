@@ -1,0 +1,9 @@
+[Icon Theme]
+Name=light
+Directories=scalable
+
+[scalable]
+Size=32
+MinSize=16
+MaxSize=128
+Type=Scalable

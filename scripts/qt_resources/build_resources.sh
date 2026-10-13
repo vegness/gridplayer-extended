@@ -1,0 +1,15 @@
+#!/bin/bash
+
+set -e
+
+SCRIPT_DIR="$( cd "$( dirname $0 )" && pwd )"
+
+. "scripts/init_app_vars.sh"
+
+echo "Building resources..."
+
+BUILD_DIR_APP_RESOURCES="$APP_BASE_DIR/resources"
+
+rm -rf "$BUILD_DIR_APP_RESOURCES"
+
+uv run --frozen "$SCRIPT_DIR/build_resources.py" "$RESOURCES_DIR" "$BUILD_DIR_APP_RESOURCES"

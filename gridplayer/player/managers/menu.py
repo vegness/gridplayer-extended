@@ -1,0 +1,163 @@
+from PyQt5.QtCore import QEvent
+from PyQt5.QtGui import QIcon
+from PyQt5.QtWidgets import QMenu
+
+from gridplayer.params.menu import SECTIONS, SUBMENUS
+from gridplayer.player.managers.actions import QDynamicAction
+from gridplayer.player.managers.base import ManagerBase
+from gridplayer.widgets.custom_menu import CustomMenu
+
+
+class MenuManager(ManagerBase):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+        # where the open menu was asked for, which is what an action picked
+        # from it is about: the pointer has gone on to the item by then
+        self._ctx.context_menu_pos = None
+
+    @property
+    def event_map(self):
+        return {
+            QEvent.ContextMenu: self.contextMenuEvent,
+        }
+
+    def contextMenuEvent(self, event):
+        event.accept()
+
+        cell = self._ctx.commands.get_cell_at(event.globalPos())
+        if getattr(cell, "is_empty_cell", False):
+            self._ctx.commands.set_add_anchor(cell)
+        else:
+            self._ctx.commands.set_add_anchor(None)
+
+        menu = self.make_menu()
+
+        self._ctx.context_menu_pos = event.globalPos()
+        try:
+            menu.exec_(event.globalPos())
+        finally:
+            self._ctx.context_menu_pos = None
+
+        self._ctx.commands.set_add_anchor(None)
+
+        # Parent is the player window; without this, each open leaks a QMenu
+        # and keeps shared QActions associated with dead menus.
+        menu.deleteLater()
+
+        return True
+
+    def make_menu(self):
+        menu = CustomMenu(parent=self.parent())
+
+        menu_sections = self._menu_sections()
+
+        self._add_menu_items(menu, menu_sections)
+
+        return menu
+
+    def _menu_sections(self):
+        sections_added = []
+
+        if self._ctx.active_block is not None:
+            sections_added.append(SECTIONS["video_active"])
+
+        if self._ctx.video_blocks:
+            sections_added.append(SECTIONS["video_all"])
+
+        sections_added.append(SECTIONS["playlist"])
+        sections_added.append(SECTIONS["program"])
+
+        return _join_menu_sections(sections_added)
+
+    def _add_menu_items(self, menu, menu_items):
+        for m_idx, m_item in enumerate(menu_items):
+            if isinstance(m_item, tuple):
+                self._add_submenu(m_item, menu)
+
+                if not menu.actions()[-1].menu().actions():
+                    menu.removeAction(menu.actions()[-1])
+            elif m_item == "---":
+                is_last_element = m_idx == len(menu_items) - 1
+                _add_separator(menu, is_last_element)
+            else:
+                action = self._ctx.actions[m_item]
+
+                if action.is_menu_inline:
+                    _add_inline_actions(action, menu)
+                else:
+                    _add_action(action, menu)
+
+        _strip_trailing_separator(menu)
+
+    def _add_submenu(self, submenu, menu):
+        sub = SUBMENUS[submenu[0]]
+        sub_items = submenu[1:]
+
+        sub_menu = CustomMenu(parent=menu)
+        sub_menu.setTitle(sub["title"])
+        if sub.get("icon"):
+            sub_menu.setIcon(QIcon.fromTheme(sub["icon"]))
+        menu.addMenu(sub_menu)
+
+        self._add_menu_items(sub_menu, sub_items)
+
+
+def _join_menu_sections(menu_sections):
+    menu = []
+    for m_block in menu_sections:
+        menu.extend(m_block)
+        if m_block != menu_sections[-1]:
+            menu.append("---")
+    return menu
+
+
+def _add_separator(menu, is_last_element):
+    is_empty_menu = not menu.actions()
+    is_trailing = not is_empty_menu and menu.actions()[-1].isSeparator()
+
+    if any([is_empty_menu, is_trailing, is_last_element]):
+        return
+
+    menu.addSeparator()
+
+
+def _strip_trailing_separator(menu: QMenu):
+    """A divider is only earning its place while something follows it.
+
+    Whether anything does is not known until the items after it have had
+    their say, and any of them may have decided not to show up.
+    """
+
+    actions = menu.actions()
+
+    if actions and actions[-1].isSeparator():
+        menu.removeAction(actions[-1])
+
+
+def _add_action(action: QDynamicAction, menu: QMenu):
+    if action.is_skipped:
+        return
+
+    menu.addAction(action.to_menu_action(menu))
+
+
+def _add_inline_actions(action: QDynamicAction, menu: QMenu):
+    """Put a generated list into this menu, in place of a submenu of its own.
+
+    For a list that belongs next to fixed actions, which a generated
+    submenu cannot hold: those need shortcuts, and a place in the keymap.
+    """
+
+    if action.show_if and not action.show_if():
+        return
+
+    for generated in action.menu_generator(menu):
+        if generated == "---":
+            _add_separator(menu, is_last_element=False)
+            continue
+
+        if generated.is_skipped:
+            continue
+
+        menu.addAction(generated.to_menu_action(menu))

@@ -1,0 +1,9 @@
+"preserve_hierarchy": false
+"base_path": "../../"
+
+files: [
+ {
+  "source" : "/resources/translations/en_US.ts",
+  "translation" : "/resources/translations/%locale_with_underscore%.%file_extension%",
+ }
+]

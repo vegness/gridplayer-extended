@@ -1,0 +1,57 @@
+# NOTICE
+
+## What this is
+
+`gridplayer-extended` is a modified copy of **GridPlayer**, originally by
+[vzhd1701](https://github.com/vzhd1701) and published at
+<https://github.com/vzhd1701/gridplayer>.
+
+It is distributed under the **GNU General Public License v3.0** (see `LICENSE`), the same
+license as the original.
+
+## Original work
+
+- **GridPlayer** — Copyright © vzhd1701 — <https://github.com/vzhd1701/gridplayer>
+- Licensed under the GNU General Public License v3.0.
+
+## Modifications
+
+In accordance with section 5(a) of the GPL, the changes made in this copy are listed
+below, with dates.
+
+### 2026-10-13 — grid layout and mini window
+
+- `gridplayer/widgets/grid_splitter.py` (new) — a splitter with a self-drawn handle,
+  used to make cell boundaries draggable.
+- `gridplayer/player/managers/grid.py` — optional "resizable cells" mode that renders
+  the grid through nested splitters, plus saving and restoring the proportions.
+- `gridplayer/player/managers/mini_window.py` (new) — float one video into a small
+  window of its own and reflow the rest around it.
+- `gridplayer/player/managers/base.py` — `is_elsewhere()` now also reports a press
+  inside a floating window as belonging to that window rather than the video under it.
+- `gridplayer/models/grid_state.py`, `gridplayer/models/playlist.py`,
+  `gridplayer/playlist_settings.py`, `gridplayer/params/defaults_fields.py`,
+  `gridplayer/params/actions.py`, `gridplayer/params/menu.py`, `gridplayer/settings.py`,
+  `gridplayer/player/player.py` — wiring for the above.
+- `tests/test_grid_splitter.py`, `tests/test_mini_window.py` (new),
+  `tests/test_managers_grid.py` — tests.
+
+### 2026-10-14 — Windows packaging
+
+- `scripts/pyinstaller/build_win.sh` — fall back to `curl` when `wget` is absent.
+- `scripts/windows/build_packages.sh` — locate `ISCC.exe` in the per-user install
+  location as well as `Program Files`.
+- `scripts/windows/installer.iss` — always show the folder page, do not reuse a previous
+  install directory, remove a previous build's runtime folders before unpacking, and
+  install per-user so no elevation is required.
+- `scripts/windows/generate_file_associations.py` — write file associations under `HKA`
+  instead of `HKCR`, which cannot be written without elevation.
+- `README.md` — rewritten for this fork: the origin stated, download links pointed at
+  this repository, upstream-only install routes marked as such.
+- `.gitignore` — ignore `temp/` and `data/`.
+
+## No endorsement
+
+The original author has **not** reviewed, approved or endorsed this copy. Nothing here
+should be read as implying otherwise, and no support should be expected from them for
+problems that originate in the modifications listed above.
