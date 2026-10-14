@@ -73,7 +73,7 @@ class AboutDialog(QDialog, Ui_AboutDialog):
                 '<a href="{APP_LICENSE_URL}">GNU GPL</a> version 3.</p>'
             ),
             self.tr(
-                '<p>Source code for this build is available on '
+                "<p>Source code for this build is available on "
                 '<a href="{APP_URL}">GitHub</a>.<br/>'
             ),
             self.tr(
