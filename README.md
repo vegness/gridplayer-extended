@@ -5,8 +5,8 @@
 > **This is a modified fork of [GridPlayer](https://github.com/vzhd1701/gridplayer)** by
 > [vzhd1701](https://github.com/vzhd1701), released under the same GNU GPL v3 license.
 > It is an unofficial build and is **not** endorsed by, affiliated with, or maintained by the
-> original author. Bug reports and feature requests about the changes below belong
-> [here](https://github.com/vegness/gridplayer-extended/issues), not upstream.
+> original author. Bug reports and feature requests about the changes below belong in
+> [this fork's issue tracker](https://github.com/vegness/gridplayer-extended/issues), not upstream.
 >
 > **Upstream is the place for the full, stable, cross-platform product.**
 > Most install methods described below (Flathub, Snap, AppImage, DMG, PyPI, Scoop) still
@@ -53,7 +53,6 @@ information about the position, sound volume, loops, aspect ratio, etc.
 - Configurable grid layout
 - Easy swap videos with drag-n-drop
 - Playlist retains settings for each video
-
 
 ## Translation
 
